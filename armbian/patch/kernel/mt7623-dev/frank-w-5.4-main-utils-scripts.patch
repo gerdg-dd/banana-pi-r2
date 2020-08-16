@@ -1,0 +1,257 @@
+diff --git a/utils/build_hostapd.sh b/utils/build_hostapd.sh
+new file mode 100644
+index 00000000..43d3d7d3
+--- /dev/null
++++ b/utils/build_hostapd.sh
+@@ -0,0 +1,20 @@
++#!/bin/bash
++
++if [ "$(stat -c %d:%i /)" != "$(stat -c %d:%i /proc/1/root/. 2>/dev/null)" ]; then
++	echo "We are chrooted! continue building..."
++
++	apt update
++	apt -y install pkg-config libssl-dev libreadline-dev libpcsclite-dev libnl-route-3-dev libnl-genl-3-dev libnl-3-dev libncurses5-dev libdbus-1-dev docbook-utils docbook-to-man
++	apt -y install git gcc make
++	cd /usr/src
++	mkdir hostapd
++	cd hostapd/
++	git clone http://w1.fi/hostap.git
++	cd hostap/hostapd/
++	cp defconfig .config
++	make
++
++	file hostapd hostapd_cli
++else
++  echo "no chroot...exiting..."
++fi
+diff --git a/utils/buildchroot.sh b/utils/buildchroot.sh
+new file mode 100644
+index 00000000..7076fae
+--- /dev/null
++++ b/utils/buildchroot.sh
+@@ -0,0 +1,36 @@
++#!/bin/bash
++sudo apt-get install qemu-user-static debootstrap binfmt-support
++
++#distro=buster
++distro=stretch
++arch=armhf
++#for bpi-r64 use
++#arch=arm64
++
++targetdir=$(pwd)/debian_${distro}_${arch}
++#if false; then
++mkdir $targetdir
++sudo debootstrap --arch=$arch --foreign $distro $targetdir
++case "$arch" in
++"armhf")
++	sudo cp /usr/bin/qemu-arm-static $targetdir/usr/bin/
++	;;
++"arm64")
++#for r64 use
++	sudo cp /usr/bin/qemu-aarch64-static $targetdir/usr/bin/
++	;;
++*) echo "unsupported arch $arch";;
++esac
++sudo cp /etc/resolv.conf $targetdir/etc
++LANG=C
++sudo chroot $targetdir /debootstrap/debootstrap --second-stage
++#fi
++langcode=de
++sudo chroot $targetdir tee "/etc/apt/sources.list" > /dev/null <<EOF
++deb http://ftp.$langcode.debian.org/debian $distro main contrib non-free
++deb-src http://ftp.$langcode.debian.org/debian $distro main contrib non-free
++deb http://ftp.$langcode.debian.org/debian $distro-updates main contrib non-free
++deb-src http://ftp.$langcode.debian.org/debian $distro-updates main contrib non-free
++deb http://security.debian.org/debian-security $distro/updates main contrib non-free
++deb-src http://security.debian.org/debian-security $distro/updates main contrib non-free
++EOF
+diff --git a/utils/firmware/LICENSE b/utils/firmware/LICENSE
+new file mode 100644
+index 00000000..be614c0
+--- /dev/null
++++ b/utils/firmware/LICENSE
+@@ -0,0 +1,39 @@
++Copyright (c) 2014, Ralink, A MediaTek Company 
++All rights reserved.
++
++Redistribution.  Redistribution and use in binary form, without 
++modification, are permitted provided that the following conditions are 
++met:
++
++* Redistributions must reproduce the above copyright notice and the 
++  following disclaimer in the documentation and/or other materials 
++  provided with the distribution. 
++* Neither the name of Ralink Technology Corporation nor the names of its
++  suppliers may be used to endorse or promote products derived from this
++  software without specific prior written permission. 
++* No reverse engineering, decompilation, or disassembly of this software 
++  is permitted.
++
++Limited patent license. Ralink Technology Corporation grants a world-wide, 
++royalty-free, non-exclusive license under patents it now or hereafter 
++owns or controls to make, have made, use, import, offer to sell and 
++sell ("Utilize") this software, but solely to the extent that any 
++such patent is necessary to Utilize the software alone, or in 
++combination with an operating system licensed under an approved Open 
++Source license as listed by the Open Source Initiative at 
++http://opensource.org/licenses.  The patent license shall not apply to 
++any other combinations which include this software.  No hardware per 
++se is licensed hereunder.
++
++DISCLAIMER.  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND 
++CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, 
++BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND 
++FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE 
++COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, 
++INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, 
++BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS 
++OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND 
++ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR 
++TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE 
++USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH 
++DAMAGE.
+diff --git a/utils/openssl.sh b/utils/openssl.sh
+new file mode 100644
+index 00000000..d807a56
+--- /dev/null
++++ b/utils/openssl.sh
+@@ -0,0 +1,42 @@
++#!/bin/bash
++(
++cd $(dirname $0)
++if [[ ! -d ./openssl ]];
++then
++  git clone --depth 1 https://github.com/openssl/openssl.git --branch OpenSSL_1_1_1-stable ./openssl
++fi
++cd openssl
++git fetch --depth 1
++
++
++export INSTALL_DIR=$(pwd)/arm
++export PATH=$INSTALL_DIR/bin:$PATH
++export TARGETMACH=arm-none-linux-gnueabihf
++export BUILDMACH=i686-pc-linux-gnu
++export CROSS=arm-linux-gnueabihf
++export CC=${CROSS}-gcc
++export LD=${CROSS}-ld
++export AS=${CROSS}-as
++export AR=${CROSS}-ar
++
++#cryptodev needs cryptodev-dir...crypto/cryptodev.h
++CDOPTS="-DHAVE_CRYPTODEV -DUSE_CRYPTODEV_DIGESTS -I../cryptodev/cryptodev-linux/"
++
++make clean
++./Configure linux-generic32 -DOPENSSL_NO_HEARTBEATS ${CDOPTS} --prefix=$INSTALL_DIR --openssldir=${INSTALL_DIR}/final shared
++echo $?
++echo "========================================================"
++
++make
++#cd ${INSTALL_DIR}/
++#cd lib
++#$AR -x libcrypto.a
++#$CC -shared *.o -o libcrypto.so
++#rm *.o
++#$AR -x libssl.a
++#$CC -shared *.o -o libssl.so
++#rm *.o
++
++#checkinstall
++checkinstall -D -A armhf --install=no --nodoc
++)
+diff --git a/utils/scripts/wifi.sh b/utils/scripts/wifi.sh
+new file mode 100644
+index 00000000..e4bbe7c
+--- /dev/null
++++ b/utils/scripts/wifi.sh
+@@ -0,0 +1,90 @@
++#!/bin/bash
++### BEGIN INIT INFO
++# Provides:       wifi
++# Required-Start: $network $remote_fs $syslog
++# Required-Stop:  $network $remote_fs $syslog
++# Default-Start:  2 3 4 5
++# Default-Stop:   0 1 6
++# Description:    Load MediaTek MT6625L firmware
++### END INIT INFO
++
++# Don't exit on error status
++set +e
++
++PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
++DAEMON=/dev/null
++NAME=wifi
++DESC="Load MediaTek MT6625L firmware wifi & BT"
++
++#disable kernel-messages
++echo 4 > /proc/sys/kernel/printk
++#disable printing messages to console
++dmesg -D
++
++if [[ ! -e /dev/wmtWifi ]];
++then
++  echo "wifidev does not exist...create it..."
++  # Check FILE exists and is executable
++  if [[ -x /usr/bin/wmt_loader ]];
++  then
++	# ??
++	/usr/bin/wmt_loader > /var/log/wmtloader.log
++	sleep 3
++  else
++	echo "Error, unable to find wmt_loader"
++  fi
++
++  # Check FILE exists and is character special
++  if  [[ -c /dev/stpwmt ]];
++  then
++	# Load firmware
++	/usr/bin/stp_uart_launcher -p /etc/firmware > /var/log/stp_launcher.log &
++	sleep 5
++  else
++  	echo "Error, device no created, /dev/stpwmt"
++  fi
++fi
++
++# Check FILE exists and is character special
++if  [[ -c /dev/wmtWifi ]];
++then
++	if [[ -n $(pidof hostapd) ]];
++	then
++		echo "hostapd running...kill it";
++		killall hostapd
++	fi
++	if [[ -n $(ip a|grep ap0) ]];
++	then
++		echo "ap0 exists, reset it";
++		echo 0 >/dev/wmtWifi
++		sleep 5
++	fi
++	echo A >/dev/wmtWifi
++	sleep 2
++else
++	echo "Error, wifi device no created, /dev/wmtWifi"
++fi
++
++# Check NIC ap0
++#ifconfig ap0
++ip addr show ap0
++if [[ $? != "0" ]]
++then
++	echo "Error, device no available, ap0"
++else
++#	echo "set MAC"
++#	ip link set ap0 address 01:02:03:04:05:06 up
++	echo "Done, all good, ready to lauch hostapd"
++	hostapd -dd /etc/hostapd/hostapd_ap0.conf > /var/log/hostapd_ap0.log &
++	echo "set IP"
++	ip addr add 192.168.10.1/24 dev ap0
++	echo "restart dnsmasq..."
++	service dnsmasq restart
++
++	#limit speed as suggested in http://wiki.banana-pi.org/Getting_Started_with_R2#WiFi_and_Ap_mode_on_R2_Openwrt
++	#tc qdisc add dev ap0 root handle 1: htb default 11
++	#tc class add dev ap0 parent 1:1 classid 1:2 htb rate 8Mbit ceil 4Mbit prio 2
++fi
++
++#load bluetooth-driver (has to be done after stp_uart_launcher)
++modprobe stp_chrdev_bt

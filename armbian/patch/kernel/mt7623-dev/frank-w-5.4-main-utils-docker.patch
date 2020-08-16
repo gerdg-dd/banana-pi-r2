@@ -1,0 +1,56 @@
+diff --git a/utils/docker/Dockerfile b/utils/docker/Dockerfile
+new file mode 100644
+index 00000000..b01f1ff
+--- /dev/null
++++ b/utils/docker/Dockerfile
+@@ -0,0 +1,26 @@
++FROM ubuntu:bionic
++
++RUN useradd -ms /bin/bash builder
++
++RUN apt-get update               \
++ && apt-get -y -q upgrade        \
++ && apt-get -y -q install        \
++    bc                           \
++    bison                        \
++    build-essential              \
++    ccache                       \
++    flex                         \
++    gcc-arm-linux-gnueabihf      \
++    gcc-aarch64-linux-gnu        \
++    git                          \
++    libc6-armhf-cross            \
++    libncurses-dev               \
++    libssl-dev                   \
++    make                         \
++    u-boot-tools                 \
++    wget                         \
++    xz-utils                     \
++ && apt-get clean
++
++USER builder
++WORKDIR /srv/
+diff --git a/utils/docker/build_container.sh b/utils/docker/build_container.sh
+new file mode 100644
+index 00000000..e47cda1
+--- /dev/null
++++ b/utils/docker/build_container.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++
++DIR=$(dirname "$(readlink -f "$0")")
++
++docker build "$DIR" --tag bpi-cross-compile:1
+diff --git a/utils/docker/run.sh b/utils/docker/run.sh
+new file mode 100644
+index 00000000..0ccfa35
+--- /dev/null
++++ b/utils/docker/run.sh
+@@ -0,0 +1,7 @@
++#!/bin/sh
++
++DIR=$(dirname "$(readlink -f "$0")")
++REPO_DIR="$DIR/../.."
++
++mkdir -p "$REPO_DIR/SD"
++docker run -it -v "$REPO_DIR/SD":/SD -v "$REPO_DIR":/srv bpi-cross-compile:1 /bin/bash
