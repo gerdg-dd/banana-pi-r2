@@ -1,0 +1,6463 @@
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/Kconfig b/drivers/net/wireless/mediatek/mt76_new/mt7622/Kconfig
+new file mode 100644
+index 00000000..bfea8ec
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/Kconfig
+@@ -0,0 +1,8 @@
++config MT7622
++	tristate "MediaTek MT7622 support"
++	select MT76_CORE
++	depends on MAC80211
++	depends on PCI
++	help
++	  This adds support for MT7622-SoC wireless devices.
++
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/Makefile b/drivers/net/wireless/mediatek/mt76_new/mt7622/Makefile
+new file mode 100644
+index 00000000..df5dc15
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/Makefile
+@@ -0,0 +1,6 @@
++#SPDX-License-Identifier: ISC
++
++obj-$(CONFIG_MT7622) += mt7622.o
++
++mt7622-y := soc.o main.o init.o eeprom.o dma.o mcu.o debugfs.o mac.o
++
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/debugfs.c b/drivers/net/wireless/mediatek/mt76_new/mt7622/debugfs.c
+new file mode 100644
+index 00000000..deb704c
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/debugfs.c
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: ISC
++/* Copyright (C) 2019 MediaTek Inc.
++ *
++ * Author: Ryder Lee <ryder.lee@mediatek.com>
++ */
++
++#include "mt7622.h"
++
++static int mt7622_read_temperature(struct seq_file *s, void *data)
++{
++	struct mt7622_dev *dev = dev_get_drvdata(s->private);
++	int temp;
++
++	/* cpu */
++	temp = mt7622_mcu_get_temperature(dev, 0);
++	seq_printf(s, "Temperature: %d\n", temp);
++
++	return 0;
++}
++
++int mt7622_init_debugfs(struct mt7622_dev *dev)
++{
++	struct dentry *dir;
++
++	dir = mt76_register_debugfs(&dev->mt76);
++	if (!dir)
++		return -ENOMEM;
++
++	debugfs_create_devm_seqfile(dev->mt76.dev, "temperature", dir,
++				mt7622_read_temperature);
++
++	return 0;
++}
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/dma.c b/drivers/net/wireless/mediatek/mt76_new/mt7622/dma.c
+new file mode 100644
+index 00000000..cc5a39d
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/dma.c
+@@ -0,0 +1,250 @@
++// SPDX-License-Identifier: ISC
++/* Copyright (C) 2019 MediaTek Inc.
++ *
++ * Author: Ryder Lee <ryder.lee@mediatek.com>
++ *         Roy Luo <royluo@google.com>
++ *         Lorenzo Bianconi <lorenzo@kernel.org>
++ *         Felix Fietkau <nbd@nbd.name>
++ */
++
++#include "mt7622.h"
++#include "../dma.h"
++#include "mac.h"
++
++static int
++mt7622_init_tx_queue(struct mt7622_dev *dev, struct mt76_sw_queue *q,
++		     int idx, int n_desc)
++{
++	struct mt76_queue *hwq;
++	int err;
++
++	hwq = devm_kzalloc(dev->mt76.dev, sizeof(*hwq), GFP_KERNEL);
++	if (!hwq)
++		return -ENOMEM;
++
++	err = mt76_queue_alloc(dev, hwq, idx, n_desc, 0, MT_TX_RING_BASE(dev));
++	if (err < 0)
++		return err;
++
++	INIT_LIST_HEAD(&q->swq);
++	q->q = hwq;
++
++	return 0;
++}
++
++void mt7622_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
++			 struct sk_buff *skb)
++{
++	struct mt7622_dev *dev = container_of(mdev, struct mt7622_dev, mt76);
++	__le32 *rxd = (__le32 *)skb->data;
++	__le32 *end = (__le32 *)&skb->data[skb->len];
++	enum rx_pkt_type type;
++
++	type = FIELD_GET(MT_RXD0_PKT_TYPE, le32_to_cpu(rxd[0]));
++
++	switch (type) {
++	case PKT_TYPE_TXS:
++		for (rxd++; rxd + 7 <= end; rxd += 7)
++			mt7622_mac_add_txs(dev, rxd);
++		dev_kfree_skb(skb);
++		break;
++	case PKT_TYPE_TXRX_NOTIFY:
++		mt7622_mac_tx_free(dev, skb);
++		break;
++	case PKT_TYPE_RX_EVENT:
++		mt7622_mcu_rx_event(dev, skb);
++		break;
++	case PKT_TYPE_NORMAL:
++		if (!mt7622_mac_fill_rx(dev, skb)) {
++			mt76_rx(&dev->mt76, q, skb);
++			return;
++		}
++		/* fall through */
++	default:
++		dev_kfree_skb(skb);
++		break;
++	}
++}
++
++static int mt7622_poll_tx(struct napi_struct *napi, int budget)
++{
++	struct mt7622_dev *dev;
++	int i;
++
++	dev = container_of(napi, struct mt7622_dev, mt76.tx_napi);
++
++	for (i = MT_TXQ_MCU; i >= 0; i--)
++		mt76_queue_tx_cleanup(dev, i, false);
++
++	if (napi_complete_done(napi, 0))
++		mt7622_irq_enable(dev, MT_INT_TX_DONE_ALL);
++
++	for (i = MT_TXQ_MCU; i >= 0; i--)
++		mt76_queue_tx_cleanup(dev, i, false);
++
++	tasklet_schedule(&dev->mt76.tx_tasklet);
++
++	return 0;
++}
++
++static u32
++mt7622_dma_sched_rr(struct mt7622_dev *dev, u32 offset)
++{
++	u32 val, ori_addr, tmp_addr = MT_DMASHDL(dev, 0);
++
++	ori_addr = mt76_rr(dev, MT_DMASHDL_REMAP(dev));
++	mt76_wr(dev, MT_DMASHDL_REMAP(dev), tmp_addr);
++	val = mt76_rr(dev, MT_DMASHDL_OFS(dev, offset));
++	mt76_wr(dev, MT_DMASHDL_REMAP(dev), ori_addr);
++
++	return val;
++}
++
++static void
++mt7622_dma_sched_wr(struct mt7622_dev *dev, u32 offset, u32 val)
++{
++	u32 ori_addr, tmp_addr = MT_DMASHDL(dev, 0);
++
++	ori_addr = mt76_rr(dev, MT_DMASHDL_REMAP(dev));
++	mt76_wr(dev, MT_DMASHDL_REMAP(dev), tmp_addr);
++	mt76_wr(dev, MT_DMASHDL_OFS(dev, offset), val);
++	mt76_wr(dev, MT_DMASHDL_REMAP(dev), ori_addr);
++}
++
++int mt7622_dma_sched_init(struct mt7622_dev *dev)
++{
++	u32 val;
++
++	val = mt7622_dma_sched_rr(dev, MT_HIF_DMASHDL_PKT_MAX_SIZE(dev));
++	val &= ~(PLE_PKT_MAX_SIZE_MASK | PSE_PKT_MAX_SIZE_MASK);
++	val |= PLE_PKT_MAX_SIZE_NUM(0x1);
++	val |= PSE_PKT_MAX_SIZE_NUM(0x8);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_PKT_MAX_SIZE(dev), val);
++
++	/* Enable refill Control Group 0, 1, 2, 4, 5 */
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_REFILL_CTRL(dev), 0xffc80000);
++	val = DMASHDL_MIN_QUOTA_NUM(0x10);
++	val |= DMASHDL_MAX_QUOTA_NUM(0x800);
++
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_GROUP0_CTRL(dev), val);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_GROUP1_CTRL(dev), val);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_GROUP2_CTRL(dev), val);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_GROUP4_CTRL(dev), val);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_GROUP5_CTRL(dev), val);
++
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_Q_MAP0(dev), 0x42104210);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_Q_MAP1(dev), 0x42104210);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_Q_MAP2(dev), 0x00000005);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_Q_MAP3(dev), 0x0);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_SHDL_SET0(dev), 0x6012345f);
++	mt7622_dma_sched_wr(dev, MT_HIF_DMASHDL_SHDL_SET1(dev), 0xedcba987);
++
++	return 0;
++}
++
++int mt7622_dma_init(struct mt7622_dev *dev)
++{
++	int i, ret;
++	static const u8 wmm_queue_map[] = {
++		[IEEE80211_AC_BK] = 0,
++		[IEEE80211_AC_BE] = 1,
++		[IEEE80211_AC_VI] = 2,
++		[IEEE80211_AC_VO] = 4,
++	};
++
++	mt76_dma_attach(&dev->mt76);
++
++	mt76_wr(dev, MT_WPDMA_GLO_CFG(dev),
++		MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE |
++		MT_WPDMA_GLO_CFG_FIFO_LITTLE_ENDIAN |
++		MT_WPDMA_GLO_CFG_OMIT_TX_INFO);
++
++	mt76_rmw_field(dev, MT_WPDMA_GLO_CFG(dev),
++		       MT_WPDMA_GLO_CFG_FW_RING_BP_TX_SCH, 0x1);
++
++	mt76_rmw_field(dev, MT_WPDMA_GLO_CFG(dev),
++		       MT_WPDMA_GLO_CFG_TX_BT_SIZE_BIT21, 0x1);
++
++	mt76_rmw_field(dev, MT_WPDMA_GLO_CFG(dev),
++		       MT_WPDMA_GLO_CFG_DMA_BURST_SIZE, 0x3);
++
++	mt76_rmw_field(dev, MT_WPDMA_GLO_CFG(dev),
++		       MT_WPDMA_GLO_CFG_MULTI_DMA_EN, 0x3);
++
++	mt76_wr(dev, MT_WPDMA_RST_IDX(dev), ~0);
++
++	for (i = 0; i < ARRAY_SIZE(wmm_queue_map); i++) {
++		ret = mt7622_init_tx_queue(dev, &dev->mt76.q_tx[i],
++					   wmm_queue_map[i],
++					   MT7622_TX_RING_SIZE);
++		if (ret)
++			return ret;
++	}
++
++	ret = mt7622_init_tx_queue(dev, &dev->mt76.q_tx[MT_TXQ_PSD],
++				   MT7622_TXQ_MGMT, MT7622_TX_RING_SIZE);
++	if (ret)
++		return ret;
++
++	ret = mt7622_init_tx_queue(dev, &dev->mt76.q_tx[MT_TXQ_MCU],
++				   MT7622_TXQ_MCU, MT7622_TX_MCU_RING_SIZE);
++	if (ret)
++		return ret;
++
++	ret = mt7622_init_tx_queue(dev, &dev->mt76.q_tx[MT_TXQ_FWDL],
++				   MT7622_TXQ_FWDL, MT7622_TX_FWDL_RING_SIZE);
++	if (ret)
++		return ret;
++
++	/* bcn quueue init,only use for hw queue idx mapping */
++	ret = mt7622_init_tx_queue(dev, &dev->mt76.q_tx[MT_TXQ_BEACON],
++				   MT_LMAC_BCN0, MT7622_TX_RING_SIZE);
++
++	/* init rx queues */
++	ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MCU], 1,
++			       MT7622_RX_MCU_RING_SIZE, MT_RX_BUF_SIZE,
++			       MT_RX_RING_BASE(dev));
++	if (ret)
++		return ret;
++
++	ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MAIN], 0,
++			       MT7622_RX_RING_SIZE, MT_RX_BUF_SIZE,
++			       MT_RX_RING_BASE(dev));
++	if (ret)
++		return ret;
++
++	mt76_wr(dev, MT_DELAY_INT_CFG(dev), 0);
++
++	ret = mt76_init_queues(dev);
++	if (ret < 0)
++		return ret;
++
++	netif_tx_napi_add(&dev->mt76.napi_dev, &dev->mt76.tx_napi,
++			  mt7622_poll_tx, NAPI_POLL_WEIGHT);
++	napi_enable(&dev->mt76.tx_napi);
++
++	mt76_poll(dev, MT_WPDMA_GLO_CFG(dev),
++		  MT_WPDMA_GLO_CFG_TX_DMA_BUSY |
++		  MT_WPDMA_GLO_CFG_RX_DMA_BUSY, 0, 1000);
++
++	/* start dma engine */
++	mt76_set(dev, MT_WPDMA_GLO_CFG(dev),
++		 MT_WPDMA_GLO_CFG_TX_DMA_EN |
++		 MT_WPDMA_GLO_CFG_RX_DMA_EN);
++
++	/* enable interrupts for TX/RX rings */
++	mt7622_irq_enable(dev, MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL);
++
++	return 0;
++}
++
++void mt7622_dma_cleanup(struct mt7622_dev *dev)
++{
++	mt76_clear(dev, MT_WPDMA_GLO_CFG(dev),
++		   MT_WPDMA_GLO_CFG_TX_DMA_EN |
++		   MT_WPDMA_GLO_CFG_RX_DMA_EN);
++	mt76_set(dev, MT_WPDMA_GLO_CFG(dev), MT_WPDMA_GLO_CFG_SW_RESET);
++
++	tasklet_kill(&dev->mt76.tx_tasklet);
++	mt76_dma_cleanup(&dev->mt76);
++}
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/eeprom.c b/drivers/net/wireless/mediatek/mt76_new/mt7622/eeprom.c
+new file mode 100644
+index 00000000..bab93aa
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/eeprom.c
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: ISC
++/* Copyright (C) 2019 MediaTek Inc.
++ *
++ * Author: Ryder Lee <ryder.lee@mediatek.com>
++ *         Felix Fietkau <nbd@nbd.name>
++ */
++
++#include "mt7622.h"
++#include "eeprom.h"
++
++static int mt7622_eeprom_load(struct mt7622_dev *dev)
++{
++	int ret;
++
++	ret = mt76_eeprom_init(&dev->mt76, MT7622_EEPROM_SIZE);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++int mt7622_eeprom_get_power_index(struct mt7622_dev *dev,
++				  struct ieee80211_channel *chan,
++				  u8 chain_idx)
++{
++	int index;
++
++	if (chain_idx > 3)
++		return -EINVAL;
++
++	index = MT_EE_TX0_2G_TARGET_POWER + chain_idx * 6;
++
++	return index;
++}
++
++static int mt7622_check_eeprom(struct mt76_dev *dev)
++{
++	u16 val = get_unaligned_le16(dev->eeprom.data);
++
++	switch (val) {
++	case 0x7622:
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static void mt7622_eeprom_parse_hw_cap(struct mt7622_dev *dev)
++{
++	u8 val, *eeprom = dev->mt76.eeprom.data;
++
++	val = FIELD_GET(MT_EE_NIC_WIFI_CONF_BAND_SEL,
++			eeprom[MT_EE_WIFI_CONF]);
++	switch (val) {
++	case MT_EE_5GHZ:
++		dev->mt76.cap.has_5ghz = true;
++		break;
++	case MT_EE_2GHZ:
++		dev->mt76.cap.has_2ghz = true;
++		break;
++	default:
++		dev->mt76.cap.has_2ghz = true;
++		dev->mt76.cap.has_5ghz = true;
++		break;
++	}
++}
++
++int mt7622_eeprom_init(struct mt7622_dev *dev)
++{
++	int ret;
++
++	ret = mt7622_eeprom_load(dev);
++	if (ret < 0)
++		return ret;
++
++	ret = mt7622_check_eeprom(&dev->mt76);
++	if (ret && dev->mt76.otp.data)
++		memcpy(dev->mt76.eeprom.data, dev->mt76.otp.data,
++		       MT7622_EEPROM_SIZE);
++
++	mt7622_eeprom_parse_hw_cap(dev);
++	memcpy(dev->mt76.macaddr, dev->mt76.eeprom.data + MT_EE_MAC_ADDR,
++	       ETH_ALEN);
++
++	mt76_eeprom_override(&dev->mt76);
++	dev_info(dev->mt76.dev, "MAC addr = %pM\n", dev->mt76.macaddr);
++
++	return 0;
++}
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/eeprom.h b/drivers/net/wireless/mediatek/mt76_new/mt7622/eeprom.h
+new file mode 100644
+index 00000000..a7faddc
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/eeprom.h
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: ISC */
++/* Copyright (C) 2019 MediaTek Inc. */
++
++#ifndef __MT7622_EEPROM_H
++#define __MT7622_EEPROM_H
++
++#include "mt7622.h"
++
++enum mt7622_eeprom_field {
++	MT_EE_CHIP_ID =				0x000,
++	MT_EE_VERSION =				0x002,
++	MT_EE_MAC_ADDR =			0x004,
++	MT_EE_NIC_CONF_0 =			0x034,
++	MT_EE_NIC_CONF_1 =			0x036,
++	MT_EE_WIFI_CONF =			0x03e,
++	MT_EE_TX0_2G_TARGET_POWER =		0x058,
++	MT_EE_TX0_5G_G0_TARGET_POWER =		0x070,
++	MT_EE_TX1_5G_G0_TARGET_POWER =		0x098,
++	MT_EE_EXT_PA_2G_TARGET_POWER =		0x0f2,
++	MT_EE_EXT_PA_5G_TARGET_POWER =		0x0f3,
++	MT_EE_TX2_5G_G0_TARGET_POWER =		0x142,
++	MT_EE_TX3_5G_G0_TARGET_POWER =		0x16a,
++
++	__MT_EE_MAX =				0x3db
++};
++
++#define MT_EE_NIC_WIFI_DBDC_ENABLE		BIT(3)
++#define MT_EE_NIC_WIFI_CONF_BAND_SEL		GENMASK(5, 4)
++
++enum mt7622_eeprom_band {
++	MT_EE_DUAL_BAND,
++	MT_EE_5GHZ,
++	MT_EE_2GHZ,
++	MT_EE_DBDC,
++};
++
++enum mt7622_channel_group {
++	MT_CH_5G_JAPAN,
++	MT_CH_5G_UNII_1,
++	MT_CH_5G_UNII_2A,
++	MT_CH_5G_UNII_2B,
++	MT_CH_5G_UNII_2E_1,
++	MT_CH_5G_UNII_2E_2,
++	MT_CH_5G_UNII_2E_3,
++	MT_CH_5G_UNII_3,
++	__MT_CH_MAX
++};
++
++static inline enum mt7622_channel_group
++mt7622_get_channel_group(int channel)
++{
++	if (channel >= 184 && channel <= 196)
++		return MT_CH_5G_JAPAN;
++	if (channel <= 48)
++		return MT_CH_5G_UNII_1;
++	if (channel <= 64)
++		return MT_CH_5G_UNII_2A;
++	if (channel <= 114)
++		return MT_CH_5G_UNII_2E_1;
++	if (channel <= 144)
++		return MT_CH_5G_UNII_2E_2;
++	if (channel <= 161)
++		return MT_CH_5G_UNII_2E_3;
++	return MT_CH_5G_UNII_3;
++}
++
++#endif
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/init.c b/drivers/net/wireless/mediatek/mt76_new/mt7622/init.c
+new file mode 100644
+index 00000000..bd4ff3c
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/init.c
+@@ -0,0 +1,284 @@
++// SPDX-License-Identifier: ISC
++/* Copyright (C) 2019 MediaTek Inc.
++ *
++ * Author: Roy Luo <royluo@google.com>
++ *         Ryder Lee <ryder.lee@mediatek.com>
++ *         Felix Fietkau <nbd@nbd.name>
++ */
++
++#include <linux/etherdevice.h>
++#include "mt7622.h"
++#include "mac.h"
++
++static void mt7622_phy_init(struct mt7622_dev *dev)
++{
++	/* disable band 0 rf low power beacon mode */
++	mt76_rmw(dev, MT_WF_PHY_WF2_RFCTRL0(dev), MT_WF_PHY_WF2_RFCTRL0_LPBCN_EN,
++		 MT_WF_PHY_WF2_RFCTRL0_LPBCN_EN);
++}
++
++static void mt7622_mac_init(struct mt7622_dev *dev)
++{
++	/* enable band 0 clk */
++	mt76_set(dev, MT_CFG_CCR(dev),
++		 MT_CFG_CCR_MAC_D0_1X_GC_EN | MT_CFG_CCR_MAC_D0_2X_GC_EN);
++
++	/* CCA Setting */
++	mt76_rmw(dev, MT_TMAC_TRCR0(dev),
++			MT_TMAC_TRCR_CCA_SEL | MT_TMAC_TRCR_SEC_CCA_SEL,
++			FIELD_PREP(MT_TMAC_TRCR_CCA_SEL, 0x2) |
++			FIELD_PREP(MT_TMAC_TRCR_SEC_CCA_SEL, 0x0));
++
++	mt76_wr(dev, MT_AGG_ACR0(dev),
++		 MT_AGG_ACR_PKT_TIME_EN | MT_AGG_ACR_NO_BA_AR_RULE |
++		 MT_AGG_ACR_LDPC_UR_EN |
++		 FIELD_PREP(MT_AGG_ACR_CFEND_RATE, 0x49) | /* 24M */
++		 FIELD_PREP(MT_AGG_ACR_BAR_RATE, 0x4b)); /* 6M */
++
++	mt76_rmw_field(dev, MT_TMAC_CTCR0(dev),
++		       MT_TMAC_CTCR0_INS_DDLMT_REFTIME, 0x3f);
++	mt76_rmw_field(dev, MT_TMAC_CTCR0(dev),
++		       MT_TMAC_CTCR0_INS_DDLMT_DENSITY, 0x3);
++	mt76_rmw(dev, MT_TMAC_CTCR0(dev),
++		 MT_TMAC_CTCR0_INS_DDLMT_EN,
++		 MT_TMAC_CTCR0_INS_DDLMT_EN);
++
++	mt7622_mcu_set_rts_thresh(dev, 0x92b);
++	mt7622_mac_set_scs(dev, true);
++
++	mt76_rmw(dev, MT_AGG_SCR(dev), MT_AGG_SCR_NLNAV_MID_PTEC_DIS,
++		 MT_AGG_SCR_NLNAV_MID_PTEC_DIS);
++
++	mt7622_mcu_init_mac(dev);
++
++	mt76_wr(dev, MT_DMA_DCR0(dev), MT_DMA_DCR0_RX_VEC_DROP |
++		FIELD_PREP(MT_DMA_DCR0_MAX_RX_LEN, 3072));
++}
++
++static int mt7622_init_hardware(struct mt7622_dev *dev)
++{
++	int ret, idx;
++
++	mt76_wr(dev, MT_INT_SOURCE_CSR(dev), ~0);
++
++	spin_lock_init(&dev->token_lock);
++	idr_init(&dev->token);
++
++	ret = mt7622_eeprom_init(dev);
++	if (ret < 0)
++		return ret;
++
++	ret = mt7622_dma_init(dev);
++	if (ret)
++		return ret;
++
++	/* MT7622 : init before f/w download*/
++	ret = mt7622_dma_sched_init(dev);
++	if (ret)
++		return ret;
++
++	set_bit(MT76_STATE_INITIALIZED, &dev->mt76.state);
++
++	ret = mt7622_mcu_init(dev);
++	if (ret)
++		return ret;
++
++	mt7622_mcu_set_eeprom(dev);
++	mt7622_mac_init(dev);
++	mt7622_phy_init(dev);
++	mt7622_mcu_ctrl_pm_state(dev, 0);
++	mt7622_mcu_del_wtbl_all(dev);
++
++	/* Beacon and mgmt frames should occupy wcid 0 */
++	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7622_WTBL_STA - 1);
++	if (idx)
++		return -ENOSPC;
++
++	dev->mt76.global_wcid.idx = idx;
++	dev->mt76.global_wcid.hw_key_idx = -1;
++	rcu_assign_pointer(dev->mt76.wcid[idx], &dev->mt76.global_wcid);
++
++	return 0;
++}
++
++#define CCK_RATE(_idx, _rate) {						\
++	.bitrate = _rate,						\
++	.flags = IEEE80211_RATE_SHORT_PREAMBLE,				\
++	.hw_value = (MT_PHY_TYPE_CCK << 8) | (_idx),			\
++	.hw_value_short = (MT_PHY_TYPE_CCK << 8) | (4 + (_idx)),	\
++}
++
++#define OFDM_RATE(_idx, _rate) {					\
++	.bitrate = _rate,						\
++	.hw_value = (MT_PHY_TYPE_OFDM << 8) | (_idx),			\
++	.hw_value_short = (MT_PHY_TYPE_OFDM << 8) | (_idx),		\
++}
++
++static struct ieee80211_rate mt7622_rates[] = {
++	CCK_RATE(0, 10),
++	CCK_RATE(1, 20),
++	CCK_RATE(2, 55),
++	CCK_RATE(3, 110),
++	OFDM_RATE(11, 60),
++	OFDM_RATE(15, 90),
++	OFDM_RATE(10, 120),
++	OFDM_RATE(14, 180),
++	OFDM_RATE(9,  240),
++	OFDM_RATE(13, 360),
++	OFDM_RATE(8,  480),
++	OFDM_RATE(12, 540),
++};
++
++static const struct ieee80211_iface_limit if_limits[] = {
++	{
++		.max = MT7622_MAX_INTERFACES,
++		.types = BIT(NL80211_IFTYPE_AP) |
++#ifdef CONFIG_MAC80211_MESH
++			 BIT(NL80211_IFTYPE_MESH_POINT) |
++#endif
++			 BIT(NL80211_IFTYPE_STATION)
++	}
++};
++
++static const struct ieee80211_iface_combination if_comb[] = {
++	{
++		.limits = if_limits,
++		.n_limits = ARRAY_SIZE(if_limits),
++		.max_interfaces = 4,
++		.num_different_channels = 1,
++		.beacon_int_infra_match = true,
++	}
++};
++
++static void
++mt7622_init_txpower(struct mt7622_dev *dev,
++		    struct ieee80211_supported_band *sband)
++{
++	int i, n_chains = hweight8(dev->mt76.antenna_mask), target_chains;
++	u8 *eep = (u8 *)dev->mt76.eeprom.data;
++
++	target_chains = n_chains;
++	for (i = 0; i < sband->n_channels; i++) {
++		struct ieee80211_channel *chan = &sband->channels[i];
++		u8 target_power = 0;
++		int j;
++
++		for (j = 0; j < target_chains; j++) {
++			int index;
++
++			index = mt7622_eeprom_get_power_index(dev, chan, j);
++			target_power = max(target_power, eep[index]);
++		}
++
++		target_power = DIV_ROUND_UP(target_power, 2);
++		switch (n_chains) {
++		case 4:
++			target_power += 6;
++			break;
++		case 3:
++			target_power += 4;
++			break;
++		case 2:
++			target_power += 3;
++			break;
++		default:
++			break;
++		}
++
++		chan->max_power = min_t(int, chan->max_reg_power,
++					target_power);
++		chan->orig_mpwr = target_power;
++	}
++}
++
++static inline void _ieee80211_hw_clear(struct ieee80211_hw *hw,
++				       enum ieee80211_hw_flags flg)
++{
++	return __clear_bit(flg, hw->flags);
++}
++
++#define ieee80211_hw_clear(hw, flg)	_ieee80211_hw_clear(hw, IEEE80211_HW_##flg)
++
++static inline void clear_wiphy_ext_feature(struct wiphy *wiphy,
++					 enum nl80211_ext_feature_index ftidx)
++{
++	u8 *ft_byte;
++
++	ft_byte = &wiphy->ext_features[ftidx / 8];
++	__clear_bit(ftidx % 8, (void *)ft_byte);
++}
++
++int mt7622_register_device(struct mt7622_dev *dev)
++{
++	struct ieee80211_hw *hw = mt76_hw(dev);
++	struct wiphy *wiphy = hw->wiphy;
++	int ret;
++
++	INIT_DELAYED_WORK(&dev->mt76.mac_work, mt7622_mac_work);
++
++	ret = mt7622_init_hardware(dev);
++	if (ret)
++		return ret;
++
++	hw->queues = 4;
++	hw->max_rates = 3;
++	hw->max_report_rates = 7;
++	hw->max_rate_tries = 11;
++
++	hw->sta_data_size = sizeof(struct mt7622_sta);
++	hw->vif_data_size = sizeof(struct mt7622_vif);
++
++	wiphy->iface_combinations = if_comb;
++	wiphy->n_iface_combinations = ARRAY_SIZE(if_comb);
++
++	dev->mt76.sband_2g.sband.ht_cap.cap |= IEEE80211_HT_CAP_LDPC_CODING;
++	dev->mt76.chainmask = 0x404;
++	dev->mt76.antenna_mask = 0xf;
++
++	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
++#ifdef CONFIG_MAC80211_MESH
++				 BIT(NL80211_IFTYPE_MESH_POINT) |
++#endif
++				 BIT(NL80211_IFTYPE_AP);
++
++	ret = mt76_register_device(&dev->mt76, false, mt7622_rates,
++				   ARRAY_SIZE(mt7622_rates));
++
++	ieee80211_hw_set(hw, SUPPORTS_REORDERING_BUFFER);
++	ieee80211_hw_set(hw, TX_STATUS_NO_AMPDU_LEN);
++
++	ieee80211_hw_clear(hw, TX_AMSDU);
++	ieee80211_hw_clear(hw, TX_FRAG_LIST);
++	clear_wiphy_ext_feature(wiphy, NL80211_EXT_FEATURE_AIRTIME_FAIRNESS);
++
++	if (ret)
++		return ret;
++
++	mt7622_init_txpower(dev, &dev->mt76.sband_2g.sband);
++
++	hw->max_tx_fragments = MT_TXP_MAX_BUF_NUM;
++
++	return mt7622_init_debugfs(dev);
++}
++
++void mt7622_unregister_device(struct mt7622_dev *dev)
++{
++	struct mt76_txwi_cache *txwi;
++	int id;
++
++	mt76_unregister_device(&dev->mt76);
++	mt7622_mcu_exit(dev);
++	mt7622_dma_cleanup(dev);
++
++	spin_lock_bh(&dev->token_lock);
++	idr_for_each_entry(&dev->token, txwi, id) {
++		mt7622_txp_skb_unmap(&dev->mt76, txwi);
++		if (txwi->skb)
++			dev_kfree_skb_any(txwi->skb);
++		mt76_put_txwi(&dev->mt76, txwi);
++	}
++	spin_unlock_bh(&dev->token_lock);
++	idr_destroy(&dev->token);
++
++	mt76_free_device(&dev->mt76);
++}
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/mac.c b/drivers/net/wireless/mediatek/mt76_new/mt7622/mac.c
+new file mode 100644
+index 00000000..ea062ff
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/mac.c
+@@ -0,0 +1,1207 @@
++// SPDX-License-Identifier: ISC
++/* Copyright (C) 2019 MediaTek Inc.
++ *
++ * Author: Ryder Lee <ryder.lee@mediatek.com>
++ *         Roy Luo <royluo@google.com>
++ *         Felix Fietkau <nbd@nbd.name>
++ *         Lorenzo Bianconi <lorenzo@kernel.org>
++ */
++
++#include <linux/etherdevice.h>
++#include <linux/timekeeping.h>
++#include "mt7622.h"
++#include "../dma.h"
++#include "mac.h"
++
++static inline s8 to_rssi(u32 field, u32 rxv)
++{
++	return (FIELD_GET(field, rxv) - 220) / 2;
++}
++
++static struct mt76_wcid *mt7622_rx_get_wcid(struct mt7622_dev *dev,
++					    u8 idx, bool unicast)
++{
++	struct mt7622_sta *sta;
++	struct mt76_wcid *wcid;
++
++	if (idx >= ARRAY_SIZE(dev->mt76.wcid))
++		return NULL;
++
++	wcid = rcu_dereference(dev->mt76.wcid[idx]);
++	if (unicast || !wcid)
++		return wcid;
++
++	if (!wcid->sta)
++		return NULL;
++
++	sta = container_of(wcid, struct mt7622_sta, wcid);
++	if (!sta->vif)
++		return NULL;
++
++	return &sta->vif->sta.wcid;
++}
++
++int mt7622_mac_fill_rx(struct mt7622_dev *dev, struct sk_buff *skb)
++{
++	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
++	struct ieee80211_supported_band *sband;
++	struct ieee80211_hdr *hdr;
++	__le32 *rxd = (__le32 *)skb->data;
++	u32 rxd0 = le32_to_cpu(rxd[0]);
++	u32 rxd1 = le32_to_cpu(rxd[1]);
++	u32 rxd2 = le32_to_cpu(rxd[2]);
++	bool unicast, remove_pad, insert_ccmp_hdr = false;
++	int i, idx;
++
++	if (!test_bit(MT76_STATE_RUNNING, &dev->mt76.state))
++		return -EINVAL;
++
++	memset(status, 0, sizeof(*status));
++
++	unicast = (rxd1 & MT_RXD1_NORMAL_ADDR_TYPE) == MT_RXD1_NORMAL_U2M;
++	idx = FIELD_GET(MT_RXD2_NORMAL_WLAN_IDX, rxd2);
++	status->wcid = mt7622_rx_get_wcid(dev, idx, unicast);
++
++	status->freq = dev->mt76.chandef.chan->center_freq;
++	status->band = dev->mt76.chandef.chan->band;
++	if (status->band == NL80211_BAND_5GHZ)
++		sband = &dev->mt76.sband_5g.sband;
++	else
++		sband = &dev->mt76.sband_2g.sband;
++
++	if (rxd2 & MT_RXD2_NORMAL_FCS_ERR)
++		status->flag |= RX_FLAG_FAILED_FCS_CRC;
++
++	if (rxd2 & MT_RXD2_NORMAL_TKIP_MIC_ERR)
++		status->flag |= RX_FLAG_MMIC_ERROR;
++
++	if (FIELD_GET(MT_RXD2_NORMAL_SEC_MODE, rxd2) != 0 &&
++	    !(rxd2 & (MT_RXD2_NORMAL_CLM | MT_RXD2_NORMAL_CM))) {
++		status->flag |= RX_FLAG_DECRYPTED;
++		status->flag |= RX_FLAG_IV_STRIPPED;
++		status->flag |= RX_FLAG_MMIC_STRIPPED | RX_FLAG_MIC_STRIPPED;
++	}
++
++	if (!(rxd2 & (MT_RXD2_NORMAL_NON_AMPDU_SUB |
++		      MT_RXD2_NORMAL_NON_AMPDU))) {
++		status->flag |= RX_FLAG_AMPDU_DETAILS;
++
++		/* all subframes of an A-MPDU have the same timestamp */
++		if (dev->rx_ampdu_ts != rxd[12]) {
++			if (!++dev->mt76.ampdu_ref)
++				dev->mt76.ampdu_ref++;
++		}
++		dev->rx_ampdu_ts = rxd[12];
++
++		status->ampdu_ref = dev->mt76.ampdu_ref;
++	}
++
++	remove_pad = rxd1 & MT_RXD1_NORMAL_HDR_OFFSET;
++
++	if (rxd2 & MT_RXD2_NORMAL_MAX_LEN_ERROR)
++		return -EINVAL;
++
++	if (!sband->channels)
++		return -EINVAL;
++
++	rxd += 4;
++	if (rxd0 & MT_RXD0_NORMAL_GROUP_4) {
++		rxd += 4;
++		if ((u8 *)rxd - skb->data >= skb->len)
++			return -EINVAL;
++	}
++
++	if (rxd0 & MT_RXD0_NORMAL_GROUP_1) {
++		u8 *data = (u8 *)rxd;
++
++		if (status->flag & RX_FLAG_DECRYPTED) {
++			status->iv[0] = data[5];
++			status->iv[1] = data[4];
++			status->iv[2] = data[3];
++			status->iv[3] = data[2];
++			status->iv[4] = data[1];
++			status->iv[5] = data[0];
++
++			insert_ccmp_hdr = FIELD_GET(MT_RXD2_NORMAL_FRAG, rxd2);
++		}
++		rxd += 4;
++		if ((u8 *)rxd - skb->data >= skb->len)
++			return -EINVAL;
++	}
++
++	if (rxd0 & MT_RXD0_NORMAL_GROUP_2) {
++		rxd += 2;
++		if ((u8 *)rxd - skb->data >= skb->len)
++			return -EINVAL;
++	}
++
++	if (rxd0 & MT_RXD0_NORMAL_GROUP_3) {
++		u32 rxdg0 = le32_to_cpu(rxd[0]);
++		u32 rxdg1 = le32_to_cpu(rxd[1]);
++		u32 rxdg3 = le32_to_cpu(rxd[3]);
++		u8 stbc = FIELD_GET(MT_RXV1_HT_STBC, rxdg0);
++		bool cck = false;
++
++		i = FIELD_GET(MT_RXV1_TX_RATE, rxdg0);
++		switch (FIELD_GET(MT_RXV1_TX_MODE, rxdg0)) {
++		case MT_PHY_TYPE_CCK:
++			cck = true;
++			/* fall through */
++		case MT_PHY_TYPE_OFDM:
++			i = mt76_get_rate(&dev->mt76, sband, i, cck);
++			break;
++		case MT_PHY_TYPE_HT_GF:
++		case MT_PHY_TYPE_HT:
++			status->encoding = RX_ENC_HT;
++			if (i > 31)
++				return -EINVAL;
++			break;
++		case MT_PHY_TYPE_VHT:
++			status->nss = FIELD_GET(MT_RXV2_NSTS, rxdg1) + 1;
++			status->encoding = RX_ENC_VHT;
++			break;
++		default:
++			return -EINVAL;
++		}
++		status->rate_idx = i;
++
++		switch (FIELD_GET(MT_RXV1_FRAME_MODE, rxdg0)) {
++		case MT_PHY_BW_20:
++			break;
++		case MT_PHY_BW_40:
++			status->bw = RATE_INFO_BW_40;
++			break;
++		case MT_PHY_BW_80:
++			status->bw = RATE_INFO_BW_80;
++			break;
++		case MT_PHY_BW_160:
++			status->bw = RATE_INFO_BW_160;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		if (rxdg0 & MT_RXV1_HT_SHORT_GI)
++			status->enc_flags |= RX_ENC_FLAG_SHORT_GI;
++		if (rxdg0 & MT_RXV1_HT_AD_CODE)
++			status->enc_flags |= RX_ENC_FLAG_LDPC;
++
++		status->enc_flags |= RX_ENC_FLAG_STBC_MASK * stbc;
++
++		status->chains = dev->mt76.antenna_mask;
++		status->chain_signal[0] = to_rssi(MT_RXV4_RCPI0, rxdg3);
++		status->chain_signal[1] = to_rssi(MT_RXV4_RCPI1, rxdg3);
++		status->chain_signal[2] = to_rssi(MT_RXV4_RCPI2, rxdg3);
++		status->chain_signal[3] = to_rssi(MT_RXV4_RCPI3, rxdg3);
++		status->signal = status->chain_signal[0];
++
++		for (i = 1; i < hweight8(dev->mt76.antenna_mask); i++) {
++			if (!(status->chains & BIT(i)))
++				continue;
++
++			status->signal = max(status->signal,
++					     status->chain_signal[i]);
++		}
++
++		rxd += 6;
++		if ((u8 *)rxd - skb->data >= skb->len)
++			return -EINVAL;
++	}
++
++	skb_pull(skb, (u8 *)rxd - skb->data + 2 * remove_pad);
++
++	if (insert_ccmp_hdr) {
++		u8 key_id = FIELD_GET(MT_RXD1_NORMAL_KEY_ID, rxd1);
++
++		mt76_insert_ccmp_hdr(skb, key_id);
++	}
++
++	hdr = (struct ieee80211_hdr *)skb->data;
++	if (!status->wcid || !ieee80211_is_data_qos(hdr->frame_control))
++		return 0;
++
++	status->aggr = unicast &&
++		       !ieee80211_is_qos_nullfunc(hdr->frame_control);
++	status->tid = *ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_TID_MASK;
++	status->seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(hdr->seq_ctrl));
++
++	return 0;
++}
++
++void mt7622_sta_ps(struct mt76_dev *mdev, struct ieee80211_sta *sta, bool ps)
++{
++}
++
++void mt7622_tx_complete_skb(struct mt76_dev *mdev, enum mt76_txq_id qid,
++			    struct mt76_queue_entry *e)
++{
++	if (!e->txwi) {
++		dev_kfree_skb_any(e->skb);
++		return;
++	}
++
++	/* error path */
++	if (e->skb == DMA_DUMMY_DATA) {
++		struct mt76_txwi_cache *t = NULL;
++
++		t = e->txwi;
++		e->skb = t ? t->skb : NULL;
++	}
++
++	if (e->skb)
++		mt76_tx_complete_skb(mdev, e->skb);
++}
++
++static u16
++mt7622_mac_tx_rate_val(struct mt7622_dev *dev,
++		       const struct ieee80211_tx_rate *rate,
++		       bool stbc, u8 *bw)
++{
++	u8 phy, nss, rate_idx;
++	u16 rateval = 0;
++
++	*bw = 0;
++
++	if (rate->flags & IEEE80211_TX_RC_VHT_MCS) {
++		rate_idx = ieee80211_rate_get_vht_mcs(rate);
++		nss = ieee80211_rate_get_vht_nss(rate);
++		phy = MT_PHY_TYPE_VHT;
++		if (rate->flags & IEEE80211_TX_RC_40_MHZ_WIDTH)
++			*bw = 1;
++		else if (rate->flags & IEEE80211_TX_RC_80_MHZ_WIDTH)
++			*bw = 2;
++		else if (rate->flags & IEEE80211_TX_RC_160_MHZ_WIDTH)
++			*bw = 3;
++	} else if (rate->flags & IEEE80211_TX_RC_MCS) {
++		rate_idx = rate->idx;
++		nss = 1 + (rate->idx >> 3);
++		phy = MT_PHY_TYPE_HT;
++		if (rate->flags & IEEE80211_TX_RC_GREEN_FIELD)
++			phy = MT_PHY_TYPE_HT_GF;
++		if (rate->flags & IEEE80211_TX_RC_40_MHZ_WIDTH)
++			*bw = 1;
++	} else {
++		const struct ieee80211_rate *r;
++		int band = dev->mt76.chandef.chan->band;
++		u16 val;
++
++		nss = 1;
++		r = &mt76_hw(dev)->wiphy->bands[band]->bitrates[rate->idx];
++		if (rate->flags & IEEE80211_TX_RC_USE_SHORT_PREAMBLE)
++			val = r->hw_value_short;
++		else
++			val = r->hw_value;
++
++		phy = val >> 8;
++		rate_idx = val & 0xff;
++	}
++
++	if (stbc && nss == 1) {
++		nss++;
++		rateval |= MT_TX_RATE_STBC;
++	}
++
++	rateval |= (FIELD_PREP(MT_TX_RATE_IDX, rate_idx) |
++		    FIELD_PREP(MT_TX_RATE_MODE, phy) |
++		    FIELD_PREP(MT_TX_RATE_NSS, nss - 1));
++
++	return rateval;
++}
++
++int mt7622_mac_write_txwi(struct mt7622_dev *dev, __le32 *txwi,
++			  struct sk_buff *skb, enum mt76_txq_id qid,
++			  struct mt76_wcid *wcid,
++			  struct ieee80211_sta *sta, int pid,
++			  struct ieee80211_key_conf *key)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	struct ieee80211_tx_rate *rate = &info->control.rates[0];
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++	bool multicast = is_multicast_ether_addr(hdr->addr1);
++	struct ieee80211_vif *vif = info->control.vif;
++	int tx_count = 8;
++	u8 fc_type, fc_stype, p_fmt, q_idx, omac_idx = 0, wmm_idx = 0;
++	__le16 fc = hdr->frame_control;
++	u16 seqno = 0;
++	u32 val, sz_txd;
++
++	static const u8 wmm_queue_map[] = {
++		[MT_TXQ_VO] /* 0 */ = MT_LMAC_AC03,
++		[MT_TXQ_VI] /* 1 */ = MT_LMAC_AC02,
++		[MT_TXQ_BE] /* 2 */ = MT_LMAC_AC01,
++		[MT_TXQ_BK] /* 3 */ = MT_LMAC_AC00,
++		[MT_TXQ_PSD] /* 4 */ = MT_LMAC_ALTX0,
++		[MT_TXQ_BEACON] /* 6 */ = MT_LMAC_BCN0,
++	};
++
++	if (vif) {
++		struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++
++		omac_idx = mvif->omac_idx;
++		wmm_idx = mvif->wmm_idx;
++	}
++
++	if (sta) {
++		struct mt7622_sta *msta = (struct mt7622_sta *)sta->drv_priv;
++
++		tx_count = msta->rate_count;
++	}
++
++	fc_type = (le16_to_cpu(fc) & IEEE80211_FCTL_FTYPE) >> 2;
++	fc_stype = (le16_to_cpu(fc) & IEEE80211_FCTL_STYPE) >> 4;
++
++	if (ieee80211_is_beacon(fc)) {
++		p_fmt = MT_TX_TYPE_FW;
++	} else {
++		p_fmt = MT_TX_TYPE_CT;
++	}
++
++	if (qid <= MT_TXQ_BK)
++		q_idx = (wmm_idx * MT7622_MAX_WMM_SETS) + wmm_queue_map[qid];
++	else
++		q_idx = wmm_queue_map[qid];
++
++	sz_txd = MT_TXD_SIZE;
++
++	val = FIELD_PREP(MT_TXD0_TX_BYTES, skb->len + sz_txd) |
++	      FIELD_PREP(MT_TXD0_P_IDX, MT_TX_PORT_IDX_LMAC) |
++	      FIELD_PREP(MT_TXD0_Q_IDX, q_idx);
++	txwi[0] = cpu_to_le32(val);
++
++	val = MT_TXD1_LONG_FORMAT |
++	      FIELD_PREP(MT_TXD1_WLAN_IDX, wcid->idx) |
++	      FIELD_PREP(MT_TXD1_HDR_FORMAT, MT_HDR_FORMAT_802_11) |
++	      FIELD_PREP(MT_TXD1_HDR_INFO,
++			 ieee80211_get_hdrlen_from_skb(skb) / 2) |
++	      FIELD_PREP(MT_TXD1_TID,
++			 skb->priority & IEEE80211_QOS_CTL_TID_MASK) |
++	      FIELD_PREP(MT_TXD1_PKT_FMT, p_fmt) |
++	      FIELD_PREP(MT_TXD1_OWN_MAC, omac_idx);
++	txwi[1] = cpu_to_le32(val);
++
++	val = FIELD_PREP(MT_TXD2_FRAME_TYPE, fc_type) |
++	      FIELD_PREP(MT_TXD2_SUB_TYPE, fc_stype) |
++	      FIELD_PREP(MT_TXD2_MULTICAST, multicast);
++	if (key) {
++		if (multicast && ieee80211_is_robust_mgmt_frame(skb) &&
++		    key->cipher == WLAN_CIPHER_SUITE_AES_CMAC) {
++			val |= MT_TXD2_BIP;
++			txwi[3] = 0;
++		} else {
++			txwi[3] = cpu_to_le32(MT_TXD3_PROTECT_FRAME);
++		}
++	} else {
++		txwi[3] = 0;
++	}
++	txwi[2] = cpu_to_le32(val);
++
++	if (!(info->flags & IEEE80211_TX_CTL_AMPDU))
++		txwi[2] |= cpu_to_le32(MT_TXD2_BA_DISABLE);
++
++	txwi[4] = 0;
++	txwi[6] = 0;
++
++	if (rate->idx >= 0 && rate->count &&
++	    !(info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE)) {
++		bool stbc = info->flags & IEEE80211_TX_CTL_STBC;
++		u8 bw;
++		u16 rateval = mt7622_mac_tx_rate_val(dev, rate, stbc, &bw);
++
++		txwi[2] |= cpu_to_le32(MT_TXD2_FIX_RATE);
++
++		val = MT_TXD6_FIXED_BW |
++		      FIELD_PREP(MT_TXD6_BW, bw) |
++		      FIELD_PREP(MT_TXD6_TX_RATE, rateval);
++		txwi[6] |= cpu_to_le32(val);
++
++		if (rate->flags & IEEE80211_TX_RC_SHORT_GI)
++			txwi[6] |= cpu_to_le32(MT_TXD6_SGI);
++
++		if (info->flags & IEEE80211_TX_CTL_LDPC)
++			txwi[6] |= cpu_to_le32(MT_TXD6_LDPC);
++
++		if (!(rate->flags & (IEEE80211_TX_RC_MCS |
++				     IEEE80211_TX_RC_VHT_MCS)))
++			txwi[2] |= cpu_to_le32(MT_TXD2_BA_DISABLE);
++
++		tx_count = rate->count;
++	}
++
++	if (!ieee80211_is_beacon(fc)) {
++		val = MT_TXD5_TX_STATUS_HOST | MT_TXD5_SW_POWER_MGMT |
++		      FIELD_PREP(MT_TXD5_PID, pid);
++		txwi[5] = cpu_to_le32(val);
++	} else {
++		txwi[5] = 0;
++		/* use maximum tx count for beacons */
++		tx_count = 0x1f;
++	}
++
++	val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, tx_count);
++	if (ieee80211_is_data_qos(hdr->frame_control)) {
++		seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(hdr->seq_ctrl));
++		val |= MT_TXD3_SN_VALID;
++	} else if (ieee80211_is_back_req(hdr->frame_control)) {
++		struct ieee80211_bar *bar = (struct ieee80211_bar *)skb->data;
++
++		seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(bar->start_seq_num));
++		val |= MT_TXD3_SN_VALID;
++	}
++	val |= FIELD_PREP(MT_TXD3_SEQ, seqno);
++
++	txwi[3] |= cpu_to_le32(val);
++
++	if (info->flags & IEEE80211_TX_CTL_NO_ACK)
++		txwi[3] |= cpu_to_le32(MT_TXD3_NO_ACK);
++
++	txwi[7] = FIELD_PREP(MT_TXD7_TYPE, fc_type) |
++		  FIELD_PREP(MT_TXD7_SUB_TYPE, fc_stype);
++
++	return 0;
++}
++
++void mt7622_txp_skb_unmap(struct mt76_dev *dev,
++			  struct mt76_txwi_cache *t)
++{
++	struct mt7622_txp *txp;
++	struct txp_ptr *txp_ptr;
++	u8 *txwi;
++	int i, nbuf = 0;
++
++	txwi = mt76_get_txwi_ptr(dev, t);
++	txp = (struct mt7622_txp *)(txwi + MT_TXD_SIZE);
++
++	/* calculate nbuf by MSDU VLD bit */
++	for (i = 0; i < MT_TXP_MAX_BUF_NUM; i++) {
++		if (txp->msdu_id[i] & cpu_to_le16(MT_MSDU_ID_VLD))
++			nbuf++;
++	}
++
++	for (i = 0; i < nbuf; i++) {
++		txp_ptr = &txp->ptr[i / 2];
++		if ((i & 0x1) == 0x0) {
++			dma_unmap_single(dev->dev, le32_to_cpu(txp_ptr->buf0),
++					le16_to_cpu(txp_ptr->len0), DMA_TO_DEVICE);
++		} else {
++			dma_unmap_single(dev->dev, le32_to_cpu(txp_ptr->buf1),
++					le16_to_cpu(txp_ptr->len1), DMA_TO_DEVICE);
++		}
++	}
++}
++
++static u32 mt7622_mac_wtbl_addr(struct mt7622_dev *dev, int wcid)
++{
++	return MT_WTBL(dev, 0) + wcid * MT_WTBL_ENTRY_SIZE;
++}
++
++
++bool mt7622_mac_wtbl_update(struct mt7622_dev *dev, int idx, u32 mask)
++{
++	mt76_rmw(dev, MT_WTBL_UPDATE(dev), MT_WTBL_UPDATE_WLAN_IDX,
++		 FIELD_PREP(MT_WTBL_UPDATE_WLAN_IDX, idx) | mask);
++
++	return mt76_poll(dev, MT_WTBL_UPDATE(dev), MT_WTBL_UPDATE_BUSY,
++			 0, 5000);
++}
++
++
++void mt7622_mac_set_rates(struct mt7622_dev *dev, struct mt7622_sta *sta,
++			  struct ieee80211_tx_rate *probe_rate,
++			  struct ieee80211_tx_rate *rates)
++{
++	struct ieee80211_tx_rate *ref;
++	int wcid = sta->wcid.idx;
++	u32 addr = mt7622_mac_wtbl_addr(dev, wcid);
++	bool stbc = false;
++	int n_rates = sta->n_rates;
++	u8 bw, bw_prev, bw_idx = 0;
++	u16 val[4];
++	u16 probe_val;
++	u32 w5, w27;
++	bool rateset;
++	int i, k;
++
++	if (!mt76_poll(dev, MT_WTBL_UPDATE(dev), MT_WTBL_UPDATE_BUSY, 0, 5000))
++		return;
++
++	for (i = n_rates; i < 4; i++)
++		rates[i] = rates[n_rates - 1];
++
++	rateset = !(sta->rate_set_tsf & BIT(0));
++	memcpy(sta->rateset[rateset].rates, rates,
++	       sizeof(sta->rateset[rateset].rates));
++	if (probe_rate) {
++		sta->rateset[rateset].probe_rate = *probe_rate;
++		ref = &sta->rateset[rateset].probe_rate;
++	} else {
++		sta->rateset[rateset].probe_rate.idx = -1;
++		ref = &sta->rateset[rateset].rates[0];
++	}
++
++	rates = sta->rateset[rateset].rates;
++	for (i = 0; i < ARRAY_SIZE(sta->rateset[rateset].rates); i++) {
++		/* We don't support switching between short and long GI
++		 * within the rate set. For accurate tx status reporting, we
++		 * need to make sure that flags match.
++		 * For improved performance, avoid duplicate entries by
++		 * decrementing the MCS index if necessary
++		 */
++		if ((ref->flags ^ rates[i].flags) & IEEE80211_TX_RC_SHORT_GI)
++			rates[i].flags ^= IEEE80211_TX_RC_SHORT_GI;
++
++		for (k = 0; k < i; k++) {
++			if (rates[i].idx != rates[k].idx)
++				continue;
++			if ((rates[i].flags ^ rates[k].flags) &
++			    (IEEE80211_TX_RC_40_MHZ_WIDTH |
++			     IEEE80211_TX_RC_80_MHZ_WIDTH |
++			     IEEE80211_TX_RC_160_MHZ_WIDTH))
++				continue;
++
++			if (!rates[i].idx)
++				continue;
++
++			rates[i].idx--;
++		}
++	}
++
++	val[0] = mt7622_mac_tx_rate_val(dev, &rates[0], stbc, &bw);
++	bw_prev = bw;
++
++	if (probe_rate) {
++		probe_val = mt7622_mac_tx_rate_val(dev, probe_rate, stbc, &bw);
++		if (bw)
++			bw_idx = 1;
++		else
++			bw_prev = 0;
++	} else {
++		probe_val = val[0];
++	}
++
++	val[1] = mt7622_mac_tx_rate_val(dev, &rates[1], stbc, &bw);
++	if (bw_prev) {
++		bw_idx = 3;
++		bw_prev = bw;
++	}
++
++	val[2] = mt7622_mac_tx_rate_val(dev, &rates[2], stbc, &bw);
++	if (bw_prev) {
++		bw_idx = 5;
++		bw_prev = bw;
++	}
++
++	val[3] = mt7622_mac_tx_rate_val(dev, &rates[3], stbc, &bw);
++	if (bw_prev)
++		bw_idx = 7;
++
++	w27 = mt76_rr(dev, addr + 27 * 4);
++	w27 &= ~MT_WTBL_W27_CC_BW_SEL;
++	w27 |= FIELD_PREP(MT_WTBL_W27_CC_BW_SEL, bw);
++
++	w5 = mt76_rr(dev, addr + 5 * 4);
++	w5 &= ~(MT_WTBL_W5_BW_CAP | MT_WTBL_W5_CHANGE_BW_RATE |
++		MT_WTBL_W5_MPDU_OK_COUNT |
++		MT_WTBL_W5_MPDU_FAIL_COUNT |
++		MT_WTBL_W5_RATE_IDX);
++	w5 |= FIELD_PREP(MT_WTBL_W5_BW_CAP, bw) |
++	      FIELD_PREP(MT_WTBL_W5_CHANGE_BW_RATE, bw_idx ? bw_idx - 1 : 7);
++
++	mt76_wr(dev, MT_WTBL_RIUCR0(dev), w5);
++
++	mt76_wr(dev, MT_WTBL_RIUCR1(dev),
++		FIELD_PREP(MT_WTBL_RIUCR1_RATE0, probe_val) |
++		FIELD_PREP(MT_WTBL_RIUCR1_RATE1, val[0]) |
++		FIELD_PREP(MT_WTBL_RIUCR1_RATE2_LO, val[1]));
++
++	mt76_wr(dev, MT_WTBL_RIUCR2(dev),
++		FIELD_PREP(MT_WTBL_RIUCR2_RATE2_HI, val[1] >> 8) |
++		FIELD_PREP(MT_WTBL_RIUCR2_RATE3, val[1]) |
++		FIELD_PREP(MT_WTBL_RIUCR2_RATE4, val[2]) |
++		FIELD_PREP(MT_WTBL_RIUCR2_RATE5_LO, val[2]));
++
++	mt76_wr(dev, MT_WTBL_RIUCR3(dev),
++		FIELD_PREP(MT_WTBL_RIUCR3_RATE5_HI, val[2] >> 4) |
++		FIELD_PREP(MT_WTBL_RIUCR3_RATE6, val[3]) |
++		FIELD_PREP(MT_WTBL_RIUCR3_RATE7, val[3]));
++
++	mt76_wr(dev, MT_WTBL_UPDATE(dev),
++		FIELD_PREP(MT_WTBL_UPDATE_WLAN_IDX, wcid) |
++		MT_WTBL_UPDATE_RATE_UPDATE |
++		MT_WTBL_UPDATE_TX_COUNT_CLEAR);
++
++	mt76_wr(dev, addr + 27 * 4, w27);
++
++	mt76_set(dev, MT_LPON_T0CR(dev), MT_LPON_T0CR_MODE); /* TSF read */
++	sta->rate_set_tsf = (mt76_rr(dev, MT_LPON_UTTR0(dev)) & ~BIT(0)) | rateset;
++
++	if (!(sta->wcid.tx_info & MT_WCID_TX_INFO_SET))
++		mt76_poll(dev, MT_WTBL_UPDATE(dev), MT_WTBL_UPDATE_BUSY, 0,
++			  5000);
++
++	sta->rate_count = 2 * MT7622_RATE_RETRY * n_rates;
++	sta->wcid.tx_info |= MT_WCID_TX_INFO_SET;
++}
++
++static enum mt7622_cipher_type
++mt7622_mac_get_cipher(int cipher)
++{
++	switch (cipher) {
++	case WLAN_CIPHER_SUITE_WEP40:
++		return MT_CIPHER_WEP40;
++	case WLAN_CIPHER_SUITE_WEP104:
++		return MT_CIPHER_WEP104;
++	case WLAN_CIPHER_SUITE_TKIP:
++		return MT_CIPHER_TKIP;
++	case WLAN_CIPHER_SUITE_AES_CMAC:
++		return MT_CIPHER_BIP_CMAC_128;
++	case WLAN_CIPHER_SUITE_CCMP:
++		return MT_CIPHER_AES_CCMP;
++	case WLAN_CIPHER_SUITE_CCMP_256:
++		return MT_CIPHER_CCMP_256;
++	case WLAN_CIPHER_SUITE_GCMP:
++		return MT_CIPHER_GCMP;
++	case WLAN_CIPHER_SUITE_GCMP_256:
++		return MT_CIPHER_GCMP_256;
++	case WLAN_CIPHER_SUITE_SMS4:
++		return MT_CIPHER_WAPI;
++	default:
++		return MT_CIPHER_NONE;
++	}
++}
++
++static int
++mt7622_mac_wtbl_update_key(struct mt7622_dev *dev, struct mt76_wcid *wcid,
++			   struct ieee80211_key_conf *key,
++			   enum mt7622_cipher_type cipher,
++			   enum set_key_cmd cmd)
++{
++	u32 addr = mt7622_mac_wtbl_addr(dev, wcid->idx) + 30 * 4;
++	u8 data[32] = {};
++
++	if (key->keylen > sizeof(data))
++		return -EINVAL;
++
++	mt76_rr_copy(dev, addr, data, sizeof(data));
++	if (cmd == SET_KEY) {
++		if (cipher == MT_CIPHER_TKIP) {
++			/* Rx/Tx MIC keys are swapped */
++			memcpy(data + 16, key->key + 24, 8);
++			memcpy(data + 24, key->key + 16, 8);
++		}
++		if (cipher != MT_CIPHER_BIP_CMAC_128 && wcid->cipher)
++			memmove(data + 16, data, 16);
++		if (cipher != MT_CIPHER_BIP_CMAC_128 || !wcid->cipher)
++			memcpy(data, key->key, key->keylen);
++		else if (cipher == MT_CIPHER_BIP_CMAC_128)
++			memcpy(data + 16, key->key, 16);
++	} else {
++		if (wcid->cipher & ~BIT(cipher)) {
++			if (cipher != MT_CIPHER_BIP_CMAC_128)
++				memmove(data, data + 16, 16);
++			memset(data + 16, 0, 16);
++		} else {
++			memset(data, 0, sizeof(data));
++		}
++	}
++	mt76_wr_copy(dev, addr, data, sizeof(data));
++
++	return 0;
++}
++
++static int
++mt7622_mac_wtbl_update_pk(struct mt7622_dev *dev, struct mt76_wcid *wcid,
++			  enum mt7622_cipher_type cipher, int keyidx,
++			  enum set_key_cmd cmd)
++{
++	u32 addr = mt7622_mac_wtbl_addr(dev, wcid->idx), w0, w1;
++
++	if (!mt76_poll(dev, MT_WTBL_UPDATE(dev), MT_WTBL_UPDATE_BUSY, 0, 5000))
++		return -ETIMEDOUT;
++
++	w0 = mt76_rr(dev, addr);
++	w1 = mt76_rr(dev, addr + 4);
++	if (cmd == SET_KEY) {
++		w0 |= MT_WTBL_W0_RX_KEY_VALID |
++		      FIELD_PREP(MT_WTBL_W0_RX_IK_VALID,
++				 cipher == MT_CIPHER_BIP_CMAC_128);
++		if (cipher != MT_CIPHER_BIP_CMAC_128 ||
++		    !wcid->cipher)
++			w0 |= FIELD_PREP(MT_WTBL_W0_KEY_IDX, keyidx);
++	}  else {
++		if (!(wcid->cipher & ~BIT(cipher)))
++			w0 &= ~(MT_WTBL_W0_RX_KEY_VALID |
++				MT_WTBL_W0_KEY_IDX);
++		if (cipher == MT_CIPHER_BIP_CMAC_128)
++			w0 &= ~MT_WTBL_W0_RX_IK_VALID;
++	}
++	mt76_wr(dev, MT_WTBL_RICR0(dev), w0);
++	mt76_wr(dev, MT_WTBL_RICR1(dev), w1);
++
++	mt76_wr(dev, MT_WTBL_UPDATE(dev),
++		FIELD_PREP(MT_WTBL_UPDATE_WLAN_IDX, wcid->idx) |
++		MT_WTBL_UPDATE_RXINFO_UPDATE);
++
++	if (!mt76_poll(dev, MT_WTBL_UPDATE(dev), MT_WTBL_UPDATE_BUSY, 0, 5000))
++		return -ETIMEDOUT;
++
++	return 0;
++}
++
++static void
++mt7622_mac_wtbl_update_cipher(struct mt7622_dev *dev, struct mt76_wcid *wcid,
++			      enum mt7622_cipher_type cipher,
++			      enum set_key_cmd cmd)
++{
++	u32 addr = mt7622_mac_wtbl_addr(dev, wcid->idx);
++
++	if (cmd == SET_KEY) {
++		if (cipher != MT_CIPHER_BIP_CMAC_128 || !wcid->cipher)
++			mt76_rmw(dev, addr + 2 * 4, MT_WTBL_W2_KEY_TYPE,
++				 FIELD_PREP(MT_WTBL_W2_KEY_TYPE, cipher));
++	} else {
++		if (cipher != MT_CIPHER_BIP_CMAC_128 &&
++		    wcid->cipher & BIT(MT_CIPHER_BIP_CMAC_128))
++			mt76_rmw(dev, addr + 2 * 4, MT_WTBL_W2_KEY_TYPE,
++				 FIELD_PREP(MT_WTBL_W2_KEY_TYPE,
++					    MT_CIPHER_BIP_CMAC_128));
++		else if (!(wcid->cipher & ~BIT(cipher)))
++			mt76_clear(dev, addr + 2 * 4, MT_WTBL_W2_KEY_TYPE);
++	}
++}
++
++int mt7622_mac_wtbl_set_key(struct mt7622_dev *dev,
++			    struct mt76_wcid *wcid,
++			    struct ieee80211_key_conf *key,
++			    enum set_key_cmd cmd)
++{
++	enum mt7622_cipher_type cipher;
++	int err;
++
++	cipher = mt7622_mac_get_cipher(key->cipher);
++	if (cipher == MT_CIPHER_NONE)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&dev->mt76.mutex);
++
++	mt7622_mac_wtbl_update_cipher(dev, wcid, cipher, cmd);
++	err = mt7622_mac_wtbl_update_key(dev, wcid, key, cipher, cmd);
++	if (err < 0)
++		goto out;
++
++	err = mt7622_mac_wtbl_update_pk(dev, wcid, cipher, key->keyidx,
++					cmd);
++	if (err < 0)
++		goto out;
++
++	if (cmd == SET_KEY)
++		wcid->cipher |= BIT(cipher);
++	else
++		wcid->cipher &= ~BIT(cipher);
++
++out:
++	mutex_unlock(&dev->mt76.mutex);
++
++	return err;
++}
++
++int mt7622_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
++			  enum mt76_txq_id qid, struct mt76_wcid *wcid,
++			  struct ieee80211_sta *sta,
++			  struct mt76_tx_info *tx_info)
++{
++	struct mt7622_dev *dev = container_of(mdev, struct mt7622_dev, mt76);
++	struct mt7622_sta *msta = container_of(wcid, struct mt7622_sta, wcid);
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(tx_info->skb);
++	struct ieee80211_key_conf *key = info->control.hw_key;
++	int i, pid, id, nbuf = tx_info->nbuf - 1;
++	u8 *txwi = (u8 *)txwi_ptr;
++	struct mt76_txwi_cache *t;
++	struct mt7622_txp *txp;
++	struct txp_ptr *txp_ptr;
++
++	if (!wcid)
++		wcid = &dev->mt76.global_wcid;
++
++	pid = mt76_tx_status_skb_add(mdev, wcid, tx_info->skb);
++
++	if (info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE) {
++		spin_lock_bh(&dev->mt76.lock);
++		mt7622_mac_set_rates(dev, msta, &info->control.rates[0],
++				     msta->rates);
++		msta->rate_probe = true;
++		spin_unlock_bh(&dev->mt76.lock);
++	}
++
++	mt7622_mac_write_txwi(dev, txwi_ptr, tx_info->skb, qid, wcid, sta,
++			      pid, key);
++
++	txp = (struct mt7622_txp *)(txwi + MT_TXD_SIZE);
++
++	t = (struct mt76_txwi_cache *)(txwi + mdev->drv->txwi_size);
++	t->skb = tx_info->skb;
++
++	tx_info->nbuf = nbuf;
++
++	/* Currently nbuf can only be 1 */
++	for (i = 0; i < nbuf; i++) {
++		txp_ptr = &txp->ptr[i / 2];
++		if ((i & 0x1) == 0x0) {
++			txp_ptr->buf0 = cpu_to_le32(tx_info->buf[i + 1].addr);
++			txp_ptr->len0 = tx_info->buf[i + 1].len | MT_MSDU_LAST;
++			if (i == nbuf - 1)
++				txp_ptr->len0 |= MT_AMSDU_LAST;
++
++			txp_ptr->len0 = cpu_to_le16(txp_ptr->len0);
++		} else {
++			txp_ptr->buf1 = cpu_to_le32(tx_info->buf[i + 1].addr);
++			txp_ptr->len1 = tx_info->buf[i + 1].len | MT_MSDU_LAST;
++			if (i == nbuf - 1)
++				txp_ptr->len1 |= MT_AMSDU_LAST;
++
++			txp_ptr->len1 = cpu_to_le16(txp_ptr->len1);
++		}
++
++		spin_lock_bh(&dev->token_lock);
++		id = idr_alloc(&dev->token, t, 0, MT7622_TOKEN_SIZE,
++			       GFP_ATOMIC);
++		spin_unlock_bh(&dev->token_lock);
++		if (id < 0)
++			return id;
++
++		txp->msdu_id[i] = cpu_to_le16(id | MT_MSDU_ID_VLD);
++	}
++
++	tx_info->skb = DMA_DUMMY_DATA;
++
++	return 0;
++}
++
++static bool mt7622_fill_txs(struct mt7622_dev *dev, struct mt7622_sta *sta,
++			    struct ieee80211_tx_info *info, __le32 *txs_data)
++{
++	struct ieee80211_supported_band *sband;
++	struct mt7622_rate_set *rs;
++	int first_idx = 0, last_idx;
++	int i, idx, count;
++	bool fixed_rate, ack_timeout;
++	bool probe, ampdu, cck = false;
++	bool rs_idx;
++	u32 rate_set_tsf;
++	u32 final_rate, final_rate_flags, final_nss, txs;
++
++	fixed_rate = info->status.rates[0].count;
++	probe = !!(info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE);
++
++	txs = le32_to_cpu(txs_data[1]);
++	ampdu = !fixed_rate && (txs & MT_TXS1_AMPDU);
++
++	txs = le32_to_cpu(txs_data[3]);
++	count = FIELD_GET(MT_TXS3_TX_COUNT, txs);
++	last_idx = FIELD_GET(MT_TXS3_LAST_TX_RATE, txs);
++
++	txs = le32_to_cpu(txs_data[0]);
++	final_rate = FIELD_GET(MT_TXS0_TX_RATE, txs);
++	ack_timeout = txs & MT_TXS0_ACK_TIMEOUT;
++
++	if (!ampdu && (txs & MT_TXS0_RTS_TIMEOUT))
++		return false;
++
++	if (txs & MT_TXS0_QUEUE_TIMEOUT)
++		return false;
++
++	if (!ack_timeout)
++		info->flags |= IEEE80211_TX_STAT_ACK;
++
++	info->status.ampdu_len = 1;
++	info->status.ampdu_ack_len = !!(info->flags &
++					IEEE80211_TX_STAT_ACK);
++
++	if (ampdu || (info->flags & IEEE80211_TX_CTL_AMPDU))
++		info->flags |= IEEE80211_TX_STAT_AMPDU | IEEE80211_TX_CTL_AMPDU;
++
++	first_idx = max_t(int, 0, last_idx - (count + 1) / MT7622_RATE_RETRY);
++
++	if (fixed_rate && !probe) {
++		info->status.rates[0].count = count;
++		i = 0;
++		goto out;
++	}
++
++	rate_set_tsf = READ_ONCE(sta->rate_set_tsf);
++	rs_idx = !((u32)(FIELD_GET(MT_TXS4_F0_TIMESTAMP,
++			 le32_to_cpu(txs_data[4])) - rate_set_tsf) < 1000000);
++	rs_idx ^= rate_set_tsf & BIT(0);
++	rs = &sta->rateset[rs_idx];
++
++	if (!first_idx && rs->probe_rate.idx >= 0) {
++		info->status.rates[0] = rs->probe_rate;
++
++		spin_lock_bh(&dev->mt76.lock);
++		if (sta->rate_probe) {
++			mt7622_mac_set_rates(dev, sta, NULL,
++							sta->rates);
++			sta->rate_probe = false;
++		}
++		spin_unlock_bh(&dev->mt76.lock);
++	} else {
++		info->status.rates[0] = rs->rates[first_idx / 2];
++	}
++	info->status.rates[0].count = 0;
++
++	for (i = 0, idx = first_idx; count && idx <= last_idx; idx++) {
++		struct ieee80211_tx_rate *cur_rate;
++		int cur_count;
++
++		cur_rate = &rs->rates[idx / 2];
++		cur_count = min_t(int, MT7622_RATE_RETRY, count);
++		count -= cur_count;
++
++		if (idx && (cur_rate->idx != info->status.rates[i].idx ||
++			    cur_rate->flags != info->status.rates[i].flags)) {
++			i++;
++			if (i == ARRAY_SIZE(info->status.rates))
++				break;
++
++			info->status.rates[i] = *cur_rate;
++			info->status.rates[i].count = 0;
++		}
++
++		info->status.rates[i].count += cur_count;
++	}
++
++out:
++	final_rate_flags = info->status.rates[i].flags;
++
++	switch (FIELD_GET(MT_TX_RATE_MODE, final_rate)) {
++	case MT_PHY_TYPE_CCK:
++		cck = true;
++		/* fall through */
++	case MT_PHY_TYPE_OFDM:
++		if (dev->mt76.chandef.chan->band == NL80211_BAND_5GHZ)
++			sband = &dev->mt76.sband_5g.sband;
++		else
++			sband = &dev->mt76.sband_2g.sband;
++		final_rate &= MT_TX_RATE_IDX;
++		final_rate = mt76_get_rate(&dev->mt76, sband, final_rate,
++					   cck);
++		final_rate_flags = 0;
++		break;
++	case MT_PHY_TYPE_HT_GF:
++	case MT_PHY_TYPE_HT:
++		final_rate_flags |= IEEE80211_TX_RC_MCS;
++		final_rate &= MT_TX_RATE_IDX;
++		if (final_rate > 31)
++			return false;
++		break;
++	case MT_PHY_TYPE_VHT:
++		final_nss = FIELD_GET(MT_TX_RATE_NSS, final_rate);
++
++		if ((final_rate & MT_TX_RATE_STBC) && final_nss)
++			final_nss--;
++
++		final_rate_flags |= IEEE80211_TX_RC_VHT_MCS;
++		final_rate = (final_rate & MT_TX_RATE_IDX) | (final_nss << 4);
++		break;
++	default:
++		return false;
++	}
++
++	info->status.rates[i].idx = final_rate;
++	info->status.rates[i].flags = final_rate_flags;
++
++	return true;
++}
++
++static bool mt7622_mac_add_txs_skb(struct mt7622_dev *dev,
++				   struct mt7622_sta *sta, int pid,
++				   __le32 *txs_data)
++{
++	struct mt76_dev *mdev = &dev->mt76;
++	struct sk_buff_head list;
++	struct sk_buff *skb;
++
++	if (pid < MT_PACKET_ID_FIRST)
++		return false;
++
++	mt76_tx_status_lock(mdev, &list);
++	skb = mt76_tx_status_skb_get(mdev, &sta->wcid, pid, &list);
++	if (skb) {
++		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++
++		if (!mt7622_fill_txs(dev, sta, info, txs_data)) {
++			ieee80211_tx_info_clear_status(info);
++			info->status.rates[0].idx = -1;
++		}
++
++		mt76_tx_status_skb_done(mdev, skb, &list);
++	}
++	mt76_tx_status_unlock(mdev, &list);
++
++	return !!skb;
++}
++
++void mt7622_mac_add_txs(struct mt7622_dev *dev, void *data)
++{
++	struct ieee80211_tx_info info = {};
++	struct ieee80211_sta *sta = NULL;
++	struct mt7622_sta *msta = NULL;
++	struct mt76_wcid *wcid;
++	__le32 *txs_data = data;
++	u32 txs;
++	u8 wcidx;
++	u8 pid;
++
++	txs = le32_to_cpu(txs_data[0]);
++	pid = FIELD_GET(MT_TXS0_PID, txs);
++	txs = le32_to_cpu(txs_data[2]);
++	wcidx = FIELD_GET(MT_TXS2_WCID, txs);
++
++	if (pid == MT_PACKET_ID_NO_ACK)
++		return;
++
++	if (wcidx >= ARRAY_SIZE(dev->mt76.wcid))
++		return;
++
++	rcu_read_lock();
++
++	wcid = rcu_dereference(dev->mt76.wcid[wcidx]);
++	if (!wcid)
++		goto out;
++
++	msta = container_of(wcid, struct mt7622_sta, wcid);
++	sta = wcid_to_sta(wcid);
++
++	if (mt7622_mac_add_txs_skb(dev, msta, pid, txs_data))
++		goto out;
++
++	if (wcidx >= MT7622_WTBL_STA || !sta)
++		goto out;
++
++	if (mt7622_fill_txs(dev, msta, &info, txs_data))
++		ieee80211_tx_status_noskb(mt76_hw(dev), sta, &info);
++
++out:
++	rcu_read_unlock();
++}
++
++void mt7622_mac_tx_free(struct mt7622_dev *dev, struct sk_buff *skb)
++{
++	struct mt7622_tx_free *free = (struct mt7622_tx_free *)skb->data;
++	struct mt76_dev *mdev = &dev->mt76;
++	struct mt76_txwi_cache *txwi;
++	int token_id;
++	u8 i, count;
++
++	count = FIELD_GET(MT_TX_FREE_MSDU_ID_CNT, le16_to_cpu(free->ctrl));
++
++	for (i = 0; i < count; i++) {
++		spin_lock_bh(&dev->token_lock);
++		token_id = (free->token[i] & 0xffff);
++		txwi = idr_remove(&dev->token, token_id);
++		spin_unlock_bh(&dev->token_lock);
++
++		if (!txwi)
++			continue;
++
++		mt7622_txp_skb_unmap(mdev, txwi);
++		if (txwi->skb) {
++			mt76_tx_complete_skb(mdev, txwi->skb);
++			txwi->skb = NULL;
++		}
++
++		mt76_put_txwi(mdev, txwi);
++	}
++	dev_kfree_skb(skb);
++}
++
++static void
++mt7622_mac_set_default_sensitivity(struct mt7622_dev *dev)
++{
++	mt76_rmw_field(dev, MT_WF_PHY_B0_MIN_PRI_PWR(dev),
++			MT_WF_PHY_B0_PD_OFDM_MASK, 0x13c);
++	mt76_rmw_field(dev, MT_WF_PHY_RXTD_CCK_PD7(dev),
++			MT_WF_PHY_PD7_CCK_MASK, 0x92);
++	mt76_rmw_field(dev, MT_WF_PHY_RXTD_CCK_PD8(dev),
++			MT_WF_PHY_PD8_CCK_MASK, 0x92);
++
++	dev->ofdm_sensitivity = -98;
++	dev->cck_sensitivity = -110;
++	dev->last_cca_adj = jiffies;
++}
++
++void mt7622_mac_set_scs(struct mt7622_dev *dev, bool enable)
++{
++	mutex_lock(&dev->mt76.mutex);
++
++	if (dev->scs_en == enable)
++		goto out;
++
++	if (enable) {
++		mt76_set(dev, MT_WF_PHY_B0_MIN_PRI_PWR(dev),
++			 MT_WF_PHY_B0_PD_BLK);
++		mt76_set(dev, MT_MIB_M0_MISC_CR(dev),
++			 GENMASK(10, 8) | GENMASK(2, 0));
++	} else
++		mt76_clear(dev, MT_WF_PHY_B0_MIN_PRI_PWR(dev),
++			 MT_WF_PHY_B0_PD_BLK);
++
++	mt7622_mac_set_default_sensitivity(dev);
++	dev->scs_en = enable;
++
++out:
++	mutex_unlock(&dev->mt76.mutex);
++}
++
++void mt7622_mac_cca_stats_reset(struct mt7622_dev *dev)
++{
++	mt76_clear(dev, MT_WF_PHY_R0_B0_PHYMUX_5(dev), GENMASK(22, 20));
++	mt76_set(dev, MT_WF_PHY_R0_B0_PHYMUX_5(dev), BIT(22) | BIT(20));
++}
++
++void mt7622_update_channel(struct mt76_dev *mdev)
++{
++	struct mt7622_dev *dev = container_of(mdev, struct mt7622_dev, mt76);
++	struct mt76_channel_state *state;
++	u64 busy_time, tx_time, rx_time, obss_time;
++
++	busy_time = mt76_get_field(dev, MT_MIB_SDR9(dev, 0),
++				   MT_MIB_SDR9_BUSY_MASK);
++	tx_time = mt76_get_field(dev, MT_MIB_SDR36(dev, 0),
++				 MT_MIB_SDR36_TXTIME_MASK);
++	rx_time = mt76_get_field(dev, MT_MIB_SDR37(dev, 0),
++				 MT_MIB_SDR37_RXTIME_MASK);
++	obss_time = mt76_get_field(dev, MT_WF_RMAC_MIB_TIME5(dev),
++				   MT_MIB_OBSSTIME_MASK);
++
++	state = mdev->chan_state;
++	state->cc_busy += busy_time;
++	state->cc_tx += tx_time;
++	state->cc_rx += rx_time + obss_time;
++	state->cc_bss_rx += rx_time;
++
++	/* reset obss airtime */
++	mt76_set(dev, MT_WF_RMAC_MIB_TIME0(dev), MT_WF_RMAC_MIB_RXTIME_CLR);
++}
++
++void mt7622_mac_work(struct work_struct *work)
++{
++	struct mt7622_dev *dev;
++
++	dev = (struct mt7622_dev *)container_of(work, struct mt76_dev,
++						mac_work.work);
++
++	mutex_lock(&dev->mt76.mutex);
++	mt7622_update_channel(&dev->mt76);
++	if (++dev->mac_work_count == 5) {
++#if 0	/* mt7622 TBD */
++		mt7622_mac_scs_check(dev);
++#endif
++		dev->mac_work_count = 0;
++	}
++	mutex_unlock(&dev->mt76.mutex);
++
++	mt76_tx_status_check(&dev->mt76, NULL, false);
++	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mt76.mac_work,
++				     MT7622_WATCHDOG_TIME);
++}
++
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/mac.h b/drivers/net/wireless/mediatek/mt76_new/mt7622/mac.h
+new file mode 100644
+index 00000000..a318df7
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/mac.h
+@@ -0,0 +1,343 @@
++/* SPDX-License-Identifier: ISC */
++/* Copyright (C) 2019 MediaTek Inc. */
++
++#ifndef __MT7622_MAC_H
++#define __MT7622_MAC_H
++
++#define MT_CT_PARSE_LEN			72
++#define MT_CT_DMA_BUF_NUM		2
++
++#define MT_RXD0_LENGTH			GENMASK(15, 0)
++#define MT_RXD0_PKT_TYPE		GENMASK(31, 29)
++
++#define MT_RXD0_NORMAL_ETH_TYPE_OFS	GENMASK(22, 16)
++#define MT_RXD0_NORMAL_IP_SUM		BIT(23)
++#define MT_RXD0_NORMAL_UDP_TCP_SUM	BIT(24)
++#define MT_RXD0_NORMAL_GROUP_1		BIT(25)
++#define MT_RXD0_NORMAL_GROUP_2		BIT(26)
++#define MT_RXD0_NORMAL_GROUP_3		BIT(27)
++#define MT_RXD0_NORMAL_GROUP_4		BIT(28)
++
++enum rx_pkt_type {
++	PKT_TYPE_TXS,
++	PKT_TYPE_TXRXV,
++	PKT_TYPE_NORMAL,
++	PKT_TYPE_RX_DUP_RFB,
++	PKT_TYPE_RX_TMR,
++	PKT_TYPE_RETRIEVE,
++	PKT_TYPE_TXRX_NOTIFY,
++	PKT_TYPE_RX_EVENT
++};
++
++#define MT_RXD1_NORMAL_BSSID		GENMASK(31, 26)
++#define MT_RXD1_NORMAL_PAYLOAD_FORMAT	GENMASK(25, 24)
++#define MT_RXD1_NORMAL_HDR_TRANS	BIT(23)
++#define MT_RXD1_NORMAL_HDR_OFFSET	BIT(22)
++#define MT_RXD1_NORMAL_MAC_HDR_LEN	GENMASK(21, 16)
++#define MT_RXD1_NORMAL_CH_FREQ		GENMASK(15, 8)
++#define MT_RXD1_NORMAL_KEY_ID		GENMASK(7, 6)
++#define MT_RXD1_NORMAL_BEACON_UC	BIT(5)
++#define MT_RXD1_NORMAL_BEACON_MC	BIT(4)
++#define MT_RXD1_NORMAL_BF_REPORT	BIT(3)
++#define MT_RXD1_NORMAL_ADDR_TYPE	GENMASK(2, 1)
++#define MT_RXD1_NORMAL_BCAST		GENMASK(2, 1)
++#define MT_RXD1_NORMAL_MCAST		BIT(2)
++#define MT_RXD1_NORMAL_U2M		BIT(1)
++#define MT_RXD1_NORMAL_HTC_VLD		BIT(0)
++
++#define MT_RXD2_NORMAL_NON_AMPDU	BIT(31)
++#define MT_RXD2_NORMAL_NON_AMPDU_SUB	BIT(30)
++#define MT_RXD2_NORMAL_NDATA		BIT(29)
++#define MT_RXD2_NORMAL_NULL_FRAME	BIT(28)
++#define MT_RXD2_NORMAL_FRAG		BIT(27)
++#define MT_RXD2_NORMAL_INT_FRAME	BIT(26)
++#define MT_RXD2_NORMAL_HDR_TRANS_ERROR	BIT(25)
++#define MT_RXD2_NORMAL_MAX_LEN_ERROR	BIT(24)
++#define MT_RXD2_NORMAL_AMSDU_ERR	BIT(23)
++#define MT_RXD2_NORMAL_LEN_MISMATCH	BIT(22)
++#define MT_RXD2_NORMAL_TKIP_MIC_ERR	BIT(21)
++#define MT_RXD2_NORMAL_ICV_ERR		BIT(20)
++#define MT_RXD2_NORMAL_CLM		BIT(19)
++#define MT_RXD2_NORMAL_CM		BIT(18)
++#define MT_RXD2_NORMAL_FCS_ERR		BIT(17)
++#define MT_RXD2_NORMAL_SW_BIT		BIT(16)
++#define MT_RXD2_NORMAL_SEC_MODE		GENMASK(15, 12)
++#define MT_RXD2_NORMAL_TID		GENMASK(11, 8)
++#define MT_RXD2_NORMAL_WLAN_IDX		GENMASK(7, 0)
++
++#define MT_RXD3_NORMAL_PF_STS		GENMASK(31, 30)
++#define MT_RXD3_NORMAL_PF_MODE		BIT(29)
++#define MT_RXD3_NORMAL_CLS_BITMAP	GENMASK(28, 19)
++#define MT_RXD3_NORMAL_WOL		GENMASK(18, 14)
++#define MT_RXD3_NORMAL_MAGIC_PKT	BIT(13)
++#define MT_RXD3_NORMAL_OFLD		GENMASK(12, 11)
++#define MT_RXD3_NORMAL_CLS		BIT(10)
++#define MT_RXD3_NORMAL_PATTERN_DROP	BIT(9)
++#define MT_RXD3_NORMAL_TSF_COMPARE_LOSS	BIT(8)
++#define MT_RXD3_NORMAL_RXV_SEQ		GENMASK(7, 0)
++
++#define MT_RXV1_ACID_DET_H		BIT(31)
++#define MT_RXV1_ACID_DET_L		BIT(30)
++#define MT_RXV1_VHTA2_B8_B3		GENMASK(29, 24)
++#define MT_RXV1_NUM_RX			GENMASK(23, 22)
++#define MT_RXV1_HT_NO_SOUND		BIT(21)
++#define MT_RXV1_HT_SMOOTH		BIT(20)
++#define MT_RXV1_HT_SHORT_GI		BIT(19)
++#define MT_RXV1_HT_AGGR			BIT(18)
++#define MT_RXV1_VHTA1_B22		BIT(17)
++#define MT_RXV1_FRAME_MODE		GENMASK(16, 15)
++#define MT_RXV1_TX_MODE			GENMASK(14, 12)
++#define MT_RXV1_HT_EXT_LTF		GENMASK(11, 10)
++#define MT_RXV1_HT_AD_CODE		BIT(9)
++#define MT_RXV1_HT_STBC			GENMASK(8, 7)
++#define MT_RXV1_TX_RATE			GENMASK(6, 0)
++
++#define MT_RXV2_SEL_ANT			BIT(31)
++#define MT_RXV2_VALID_BIT		BIT(30)
++#define MT_RXV2_NSTS			GENMASK(29, 27)
++#define MT_RXV2_GROUP_ID		GENMASK(26, 21)
++#define MT_RXV2_LENGTH			GENMASK(20, 0)
++
++#define MT_RXV4_RCPI3			GENMASK(31, 24)
++#define MT_RXV4_RCPI2			GENMASK(23, 16)
++#define MT_RXV4_RCPI1			GENMASK(15, 8)
++#define MT_RXV4_RCPI0			GENMASK(7, 0)
++
++enum tx_header_format {
++	MT_HDR_FORMAT_802_3,
++	MT_HDR_FORMAT_CMD,
++	MT_HDR_FORMAT_802_11,
++	MT_HDR_FORMAT_802_11_EXT,
++};
++
++enum tx_pkt_type {
++	MT_TX_TYPE_CT,
++	MT_TX_TYPE_SF,
++	MT_TX_TYPE_CMD,
++	MT_TX_TYPE_FW,
++};
++
++enum tx_pkt_queue_idx {
++	MT_LMAC_AC00,	/* BK */
++	MT_LMAC_AC01,	/* BE */
++	MT_LMAC_AC02,	/* VI */
++	MT_LMAC_AC03,	/* VO */
++	MT_LMAC_AC10,
++	MT_LMAC_AC11,
++	MT_LMAC_AC12,
++	MT_LMAC_AC13,
++	MT_LMAC_AC20,
++	MT_LMAC_AC21,
++	MT_LMAC_AC22,
++	MT_LMAC_AC23,
++	MT_LMAC_AC30,
++	MT_LMAC_AC31,
++	MT_LMAC_AC32,
++	MT_LMAC_AC33,
++
++	MT_LMAC_ALTX0 = 0x10,
++	MT_LMAC_BMC0 = 0x11,
++	MT_LMAC_BCN0 = 0x12,
++
++	MT_LMAC_ALTX1 = 0x14,
++	MT_LMAC_BMC1 = 0x15,
++	MT_LMAC_BCN1 = 0x16,
++};
++
++enum tx_port_idx {
++	MT_TX_PORT_IDX_LMAC,
++	MT_TX_PORT_IDX_MCU
++};
++
++enum tx_mcu_port_q_idx {
++	MT_TX_MCU_PORT_RX_Q0 = 0,
++	MT_TX_MCU_PORT_RX_Q1,
++	MT_TX_MCU_PORT_RX_Q2,
++	MT_TX_MCU_PORT_RX_Q3,
++	MT_TX_MCU_PORT_RX_FWDL = 0x1e
++};
++
++enum tx_phy_bandwidth {
++	MT_PHY_BW_20,
++	MT_PHY_BW_40,
++	MT_PHY_BW_80,
++	MT_PHY_BW_160,
++};
++
++#define MT_CT_INFO_APPLY_TXD		BIT(0)
++#define MT_CT_INFO_COPY_HOST_TXD_ALL	BIT(1)
++#define MT_CT_INFO_MGMT_FRAME		BIT(2)
++#define MT_CT_INFO_NONE_CIPHER_FRAME	BIT(3)
++#define MT_CT_INFO_HSR2_TX		BIT(4)
++
++#define MT_TXD_SIZE			(8 * 4)
++
++#define MT_TXD0_P_IDX			BIT(31)
++#define MT_TXD0_Q_IDX			GENMASK(30, 26)
++#define MT_TXD0_UDP_TCP_SUM		BIT(24)
++#define MT_TXD0_IP_SUM			BIT(23)
++#define MT_TXD0_ETH_TYPE_OFFSET		GENMASK(22, 16)
++#define MT_TXD0_TX_BYTES		GENMASK(15, 0)
++
++#define MT_TXD1_OWN_MAC			GENMASK(31, 26)
++#define MT_TXD1_PKT_FMT			GENMASK(25, 24)
++#define MT_TXD1_TID			GENMASK(23, 21)
++#define MT_TXD1_AMSDU			BIT(20)
++#define MT_TXD1_UNXV			BIT(19)
++#define MT_TXD1_HDR_PAD			GENMASK(18, 17)
++#define MT_TXD1_TXD_LEN			BIT(16)
++#define MT_TXD1_LONG_FORMAT		BIT(15)
++#define MT_TXD1_HDR_FORMAT		GENMASK(14, 13)
++#define MT_TXD1_HDR_INFO		GENMASK(12, 8)
++#define MT_TXD1_WLAN_IDX		GENMASK(7, 0)
++
++#define MT_TXD2_FIX_RATE		BIT(31)
++#define MT_TXD2_TIMING_MEASURE		BIT(30)
++#define MT_TXD2_BA_DISABLE		BIT(29)
++#define MT_TXD2_POWER_OFFSET		GENMASK(28, 24)
++#define MT_TXD2_MAX_TX_TIME		GENMASK(23, 16)
++#define MT_TXD2_FRAG			GENMASK(15, 14)
++#define MT_TXD2_HTC_VLD			BIT(13)
++#define MT_TXD2_DURATION		BIT(12)
++#define MT_TXD2_BIP			BIT(11)
++#define MT_TXD2_MULTICAST		BIT(10)
++#define MT_TXD2_RTS			BIT(9)
++#define MT_TXD2_SOUNDING		BIT(8)
++#define MT_TXD2_NDPA			BIT(7)
++#define MT_TXD2_NDP			BIT(6)
++#define MT_TXD2_FRAME_TYPE		GENMASK(5, 4)
++#define MT_TXD2_SUB_TYPE		GENMASK(3, 0)
++
++#define MT_TXD3_SN_VALID		BIT(31)
++#define MT_TXD3_PN_VALID		BIT(30)
++#define MT_TXD3_SEQ			GENMASK(27, 16)
++#define MT_TXD3_REM_TX_COUNT		GENMASK(15, 11)
++#define MT_TXD3_TX_COUNT		GENMASK(10, 6)
++#define MT_TXD3_PROTECT_FRAME		BIT(1)
++#define MT_TXD3_NO_ACK			BIT(0)
++
++#define MT_TXD4_PN_LOW			GENMASK(31, 0)
++
++#define MT_TXD5_PN_HIGH			GENMASK(31, 16)
++#define MT_TXD5_SW_POWER_MGMT		BIT(13)
++#define MT_TXD5_DA_SELECT		BIT(11)
++#define MT_TXD5_TX_STATUS_HOST		BIT(10)
++#define MT_TXD5_TX_STATUS_MCU		BIT(9)
++#define MT_TXD5_TX_STATUS_FMT		BIT(8)
++#define MT_TXD5_PID			GENMASK(7, 0)
++
++#define MT_TXD6_FIXED_RATE		BIT(31)
++#define MT_TXD6_SGI			BIT(30)
++#define MT_TXD6_LDPC			BIT(29)
++#define MT_TXD6_TX_BF			BIT(28)
++#define MT_TXD6_TX_RATE			GENMASK(27, 16)
++#define MT_TXD6_ANT_ID			GENMASK(15, 4)
++#define MT_TXD6_DYN_BW			BIT(3)
++#define MT_TXD6_FIXED_BW		BIT(2)
++#define MT_TXD6_BW			GENMASK(1, 0)
++
++#define MT_TXD7_TYPE			GENMASK(21, 20)
++#define MT_TXD7_SUB_TYPE		GENMASK(19, 16)
++
++#define MT_TX_RATE_STBC			BIT(11)
++#define MT_TX_RATE_NSS			GENMASK(10, 9)
++#define MT_TX_RATE_MODE			GENMASK(8, 6)
++#define MT_TX_RATE_IDX			GENMASK(5, 0)
++
++#define MT_MSDU_ID_VLD			BIT(15)
++#define MT_MSDU_LAST			BIT(14)
++#define MT_AMSDU_LAST			BIT(15)
++
++#define MT_TXP_MAX_BUF_NUM		4
++
++struct txp_ptr {
++	__le32 buf0;
++	__le16 len0;
++	__le16 len1;
++	__le32 buf1;
++} __packed;
++
++struct mt7622_txp {
++	__le16 msdu_id[MT_TXP_MAX_BUF_NUM];
++	struct txp_ptr ptr[MT_TXP_MAX_BUF_NUM / 2];
++} __packed;
++
++struct mt7622_tx_free {
++	__le16 rx_byte_cnt;
++	__le16 ctrl;
++	u8 txd_cnt;
++	u8 rsv0;
++	u8 ctrl2;
++	u8 rev1;
++	__le32 token[];
++} __packed;
++
++#define MT_TX_FREE_MSDU_ID_CNT		GENMASK(6, 0)
++
++#define MT_TXS0_PID			GENMASK(31, 24)
++#define MT_TXS0_BA_ERROR		BIT(22)
++#define MT_TXS0_PS_FLAG			BIT(21)
++#define MT_TXS0_TXOP_TIMEOUT		BIT(20)
++#define MT_TXS0_BIP_ERROR		BIT(19)
++
++#define MT_TXS0_QUEUE_TIMEOUT		BIT(18)
++#define MT_TXS0_RTS_TIMEOUT		BIT(17)
++#define MT_TXS0_ACK_TIMEOUT		BIT(16)
++#define MT_TXS0_ACK_ERROR_MASK		GENMASK(18, 16)
++
++#define MT_TXS0_TX_STATUS_HOST		BIT(15)
++#define MT_TXS0_TX_STATUS_MCU		BIT(14)
++#define MT_TXS0_TXS_FORMAT		BIT(13)
++#define MT_TXS0_FIXED_RATE		BIT(12)
++#define MT_TXS0_TX_RATE			GENMASK(11, 0)
++
++#define MT_TXS1_ANT_ID			GENMASK(31, 20)
++#define MT_TXS1_RESP_RATE		GENMASK(19, 16)
++#define MT_TXS1_BW			GENMASK(15, 14)
++#define MT_TXS1_I_TXBF			BIT(13)
++#define MT_TXS1_E_TXBF			BIT(12)
++#define MT_TXS1_TID			GENMASK(11, 9)
++#define MT_TXS1_AMPDU			BIT(8)
++#define MT_TXS1_ACKED_MPDU		BIT(7)
++#define MT_TXS1_TX_POWER_DBM		GENMASK(6, 0)
++
++#define MT_TXS2_WCID			GENMASK(31, 24)
++#define MT_TXS2_RXV_SEQNO		GENMASK(23, 16)
++#define MT_TXS2_TX_DELAY		GENMASK(15, 0)
++
++#define MT_TXS3_LAST_TX_RATE		GENMASK(31, 29)
++#define MT_TXS3_TX_COUNT		GENMASK(28, 24)
++#define MT_TXS3_F1_TSSI1		GENMASK(23, 12)
++#define MT_TXS3_F1_TSSI0		GENMASK(11, 0)
++#define MT_TXS3_F0_SEQNO		GENMASK(11, 0)
++
++#define MT_TXS4_F0_TIMESTAMP		GENMASK(31, 0)
++#define MT_TXS4_F1_TSSI3		GENMASK(23, 12)
++#define MT_TXS4_F1_TSSI2		GENMASK(11, 0)
++
++#define MT_TXS5_F0_FRONT_TIME		GENMASK(24, 0)
++#define MT_TXS5_F1_NOISE_2		GENMASK(23, 16)
++#define MT_TXS5_F1_NOISE_1		GENMASK(15, 8)
++#define MT_TXS5_F1_NOISE_0		GENMASK(7, 0)
++
++#define MT_TXS6_F1_RCPI_3		GENMASK(31, 24)
++#define MT_TXS6_F1_RCPI_2		GENMASK(23, 16)
++#define MT_TXS6_F1_RCPI_1		GENMASK(15, 8)
++#define MT_TXS6_F1_RCPI_0		GENMASK(7, 0)
++
++enum mt7622_cipher_type {
++	MT_CIPHER_NONE,
++	MT_CIPHER_WEP40,
++	MT_CIPHER_TKIP,
++	MT_CIPHER_TKIP_NO_MIC,
++	MT_CIPHER_AES_CCMP,
++	MT_CIPHER_WEP104,
++	MT_CIPHER_BIP_CMAC_128,
++	MT_CIPHER_WEP128,
++	MT_CIPHER_WAPI,
++	MT_CIPHER_CCMP_256 = 10,
++	MT_CIPHER_GCMP,
++	MT_CIPHER_GCMP_256,
++};
++
++#endif
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/main.c b/drivers/net/wireless/mediatek/mt76_new/mt7622/main.c
+new file mode 100644
+index 00000000..4e9d915
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/main.c
+@@ -0,0 +1,539 @@
++// SPDX-License-Identifier: ISC
++/* Copyright (C) 2019 MediaTek Inc.
++ *
++ * Author: Roy Luo <royluo@google.com>
++ *         Ryder Lee <ryder.lee@mediatek.com>
++ *         Felix Fietkau <nbd@nbd.name>
++ */
++
++#include <linux/etherdevice.h>
++#include <linux/platform_device.h>
++#include <linux/pci.h>
++#include <linux/module.h>
++#include "mt7622.h"
++
++static int mt7622_start(struct ieee80211_hw *hw)
++{
++	struct mt7622_dev *dev = hw->priv;
++
++	dev->mt76.survey_time = ktime_get_boottime();
++	set_bit(MT76_STATE_RUNNING, &dev->mt76.state);
++	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mt76.mac_work,
++				     MT7622_WATCHDOG_TIME);
++
++	return 0;
++}
++
++static void mt7622_stop(struct ieee80211_hw *hw)
++{
++	struct mt7622_dev *dev = hw->priv;
++
++	clear_bit(MT76_STATE_RUNNING, &dev->mt76.state);
++	cancel_delayed_work_sync(&dev->mt76.mac_work);
++}
++
++static int get_omac_idx(enum nl80211_iftype type, u32 mask)
++{
++	int i;
++
++	switch (type) {
++	case NL80211_IFTYPE_AP:
++	case NL80211_IFTYPE_MESH_POINT:
++		/* ap use hw bssid 0 and ext bssid */
++		if (~mask & BIT(HW_BSSID_0))
++			return HW_BSSID_0;
++
++		for (i = EXT_BSSID_1; i < EXT_BSSID_END; i++)
++			if (~mask & BIT(i))
++				return i;
++
++		break;
++	case NL80211_IFTYPE_STATION:
++		/* sta use hw bssid other than 0 */
++		for (i = HW_BSSID_1; i < HW_BSSID_MAX; i++)
++			if (~mask & BIT(i))
++				return i;
++
++		break;
++	default:
++		WARN_ON(1);
++		break;
++	};
++
++	return -1;
++}
++
++static int mt7622_add_interface(struct ieee80211_hw *hw,
++				struct ieee80211_vif *vif)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct mt7622_dev *dev = hw->priv;
++	struct mt76_txq *mtxq;
++	int idx, ret = 0;
++
++	mutex_lock(&dev->mt76.mutex);
++
++	mvif->idx = ffs(~dev->vif_mask) - 1;
++	if (mvif->idx >= MT7622_MAX_INTERFACES) {
++		ret = -ENOSPC;
++		goto out;
++	}
++
++	idx = get_omac_idx(vif->type, dev->omac_mask);
++	if (idx < 0) {
++		ret = -ENOSPC;
++		goto out;
++	}
++	mvif->omac_idx = idx;
++
++	mvif->band_idx = 0;
++	mvif->wmm_idx = mvif->idx % MT7622_MAX_WMM_SETS;
++
++	ret = mt7622_mcu_set_dev_info(dev, vif, 1);
++	if (ret)
++		goto out;
++
++	dev->vif_mask |= BIT(mvif->idx);
++	dev->omac_mask |= BIT(mvif->omac_idx);
++	idx = MT7622_WTBL_RESERVED - mvif->idx;
++	mvif->sta.wcid.idx = idx;
++	mvif->sta.wcid.hw_key_idx = -1;
++
++	rcu_assign_pointer(dev->mt76.wcid[idx], &mvif->sta.wcid);
++	mtxq = (struct mt76_txq *)vif->txq->drv_priv;
++	mtxq->wcid = &mvif->sta.wcid;
++	mt76_txq_init(&dev->mt76, vif->txq);
++
++out:
++	mutex_unlock(&dev->mt76.mutex);
++
++	return ret;
++}
++
++static void mt7622_remove_interface(struct ieee80211_hw *hw,
++				    struct ieee80211_vif *vif)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct mt7622_dev *dev = hw->priv;
++	int idx = mvif->sta.wcid.idx;
++
++	/* TODO: disable beacon for the bss */
++
++	mt7622_mcu_set_dev_info(dev, vif, 0);
++
++	rcu_assign_pointer(dev->mt76.wcid[idx], NULL);
++	mt76_txq_remove(&dev->mt76, vif->txq);
++
++	mutex_lock(&dev->mt76.mutex);
++	dev->vif_mask &= ~BIT(mvif->idx);
++	dev->omac_mask &= ~BIT(mvif->omac_idx);
++	mutex_unlock(&dev->mt76.mutex);
++}
++
++static int mt7622_set_channel(struct mt7622_dev *dev)
++{
++	int ret;
++
++	cancel_delayed_work_sync(&dev->mt76.mac_work);
++
++	mutex_lock(&dev->mt76.mutex);
++	set_bit(MT76_RESET, &dev->mt76.state);
++
++	mt76_set_channel(&dev->mt76);
++
++	ret = mt7622_mcu_set_channel(dev);
++	if (ret)
++		goto out;
++
++	mt7622_mac_cca_stats_reset(dev);
++	dev->mt76.survey_time = ktime_get_boottime();
++	mt76_rr(dev, MT_MIB_SDR16(dev, 0));
++
++out:
++	clear_bit(MT76_RESET, &dev->mt76.state);
++	mutex_unlock(&dev->mt76.mutex);
++
++	mt76_txq_schedule_all(&dev->mt76);
++	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mt76.mac_work,
++				     MT7622_WATCHDOG_TIME);
++	return ret;
++}
++
++static int mt7622_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
++			  struct ieee80211_vif *vif, struct ieee80211_sta *sta,
++			  struct ieee80211_key_conf *key)
++{
++	struct mt7622_dev *dev = hw->priv;
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct mt7622_sta *msta = sta ? (struct mt7622_sta *)sta->drv_priv :
++				  &mvif->sta;
++	struct mt76_wcid *wcid = &msta->wcid;
++	int idx = key->keyidx;
++
++	/* The hardware does not support per-STA RX GTK, fallback
++	 * to software mode for these.
++	 */
++	if ((vif->type == NL80211_IFTYPE_ADHOC ||
++	     vif->type == NL80211_IFTYPE_MESH_POINT) &&
++	    (key->cipher == WLAN_CIPHER_SUITE_TKIP ||
++	     key->cipher == WLAN_CIPHER_SUITE_CCMP) &&
++	    !(key->flags & IEEE80211_KEY_FLAG_PAIRWISE))
++		return -EOPNOTSUPP;
++
++	/* fall back to sw encryption for unsupported ciphers */
++	switch (key->cipher) {
++	case WLAN_CIPHER_SUITE_AES_CMAC:
++		key->flags |= IEEE80211_KEY_FLAG_GENERATE_MMIE;
++		break;
++	case WLAN_CIPHER_SUITE_WEP40:
++	case WLAN_CIPHER_SUITE_WEP104:
++	case WLAN_CIPHER_SUITE_TKIP:
++	case WLAN_CIPHER_SUITE_CCMP:
++	case WLAN_CIPHER_SUITE_CCMP_256:
++	case WLAN_CIPHER_SUITE_GCMP:
++	case WLAN_CIPHER_SUITE_GCMP_256:
++	case WLAN_CIPHER_SUITE_SMS4:
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	if (cmd == SET_KEY) {
++		key->hw_key_idx = wcid->idx;
++		wcid->hw_key_idx = idx;
++	} else if (idx == wcid->hw_key_idx) {
++		wcid->hw_key_idx = -1;
++	}
++	mt76_wcid_key_setup(&dev->mt76, wcid,
++			    cmd == SET_KEY ? key : NULL);
++
++	return mt7622_mac_wtbl_set_key(dev, wcid, key, cmd);
++}
++
++static int mt7622_config(struct ieee80211_hw *hw, u32 changed)
++{
++	struct mt7622_dev *dev = hw->priv;
++	int ret = 0;
++
++	if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
++		ieee80211_stop_queues(hw);
++		ret = mt7622_set_channel(dev);
++		ieee80211_wake_queues(hw);
++	}
++
++	mutex_lock(&dev->mt76.mutex);
++
++	if (changed & IEEE80211_CONF_CHANGE_POWER)
++		ret = mt7622_mcu_set_tx_power(dev);
++
++	if (changed & IEEE80211_CONF_CHANGE_MONITOR) {
++		if (!(hw->conf.flags & IEEE80211_CONF_MONITOR))
++			dev->mt76.rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
++		else
++			dev->mt76.rxfilter &= ~MT_WF_RFCR_DROP_OTHER_UC;
++
++		mt76_wr(dev, MT_WF_RFCR(dev), dev->mt76.rxfilter);
++	}
++
++	mutex_unlock(&dev->mt76.mutex);
++
++	return ret;
++}
++
++static int
++mt7622_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif, u16 queue,
++	       const struct ieee80211_tx_queue_params *params)
++{
++	static const u8 wmm_queue_map[] = {
++		[IEEE80211_AC_BK]/*3*/ = 0,
++		[IEEE80211_AC_BE]/*2*/ = 1,
++		[IEEE80211_AC_VI]/*1*/ = 2,
++		[IEEE80211_AC_VO]/*0*/ = 4,
++	};
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct mt7622_dev *dev = hw->priv;
++	u16 wmm_mapping = mvif->wmm_idx * MT7622_MAX_WMM_SETS;
++
++	wmm_mapping += wmm_queue_map[queue];
++	return mt7622_mcu_set_wmm(dev, wmm_mapping, params);
++}
++
++static void mt7622_configure_filter(struct ieee80211_hw *hw,
++				    unsigned int changed_flags,
++				    unsigned int *total_flags,
++				    u64 multicast)
++{
++	struct mt7622_dev *dev = hw->priv;
++	u32 flags = 0;
++
++#define MT76_FILTER(_flag, _hw) do { \
++		flags |= *total_flags & FIF_##_flag;			\
++		dev->mt76.rxfilter &= ~(_hw);				\
++		dev->mt76.rxfilter |= !(flags & FIF_##_flag) * (_hw);	\
++	} while (0)
++
++	dev->mt76.rxfilter &= ~(MT_WF_RFCR_DROP_OTHER_BSS |
++				MT_WF_RFCR_DROP_OTHER_BEACON |
++				MT_WF_RFCR_DROP_FRAME_REPORT |
++				MT_WF_RFCR_DROP_PROBEREQ |
++				MT_WF_RFCR_DROP_MCAST_FILTERED |
++				MT_WF_RFCR_DROP_MCAST |
++				MT_WF_RFCR_DROP_BCAST |
++				MT_WF_RFCR_DROP_DUPLICATE |
++				MT_WF_RFCR_DROP_A2_BSSID |
++				MT_WF_RFCR_DROP_UNWANTED_CTL |
++				MT_WF_RFCR_DROP_STBC_MULTI);
++
++	MT76_FILTER(OTHER_BSS, MT_WF_RFCR_DROP_OTHER_TIM |
++			       MT_WF_RFCR_DROP_A3_MAC |
++			       MT_WF_RFCR_DROP_A3_BSSID);
++
++	MT76_FILTER(FCSFAIL, MT_WF_RFCR_DROP_FCSFAIL);
++
++	MT76_FILTER(CONTROL, MT_WF_RFCR_DROP_CTS |
++			     MT_WF_RFCR_DROP_RTS |
++			     MT_WF_RFCR_DROP_CTL_RSV |
++			     MT_WF_RFCR_DROP_NDPA);
++
++	*total_flags = flags;
++	mt76_wr(dev, MT_WF_RFCR(dev), dev->mt76.rxfilter);
++}
++
++static void mt7622_bss_info_changed(struct ieee80211_hw *hw,
++				    struct ieee80211_vif *vif,
++				    struct ieee80211_bss_conf *info,
++				    u32 changed)
++{
++	struct mt7622_dev *dev = hw->priv;
++
++	mutex_lock(&dev->mt76.mutex);
++
++	if (changed & BSS_CHANGED_ASSOC)
++		mt7622_mcu_set_bss_info(dev, vif, info->assoc);
++
++	if (changed & BSS_CHANGED_BEACON_ENABLED) {
++		mt7622_mcu_set_bss_info(dev, vif, info->enable_beacon);
++		mt7622_mcu_wtbl_bmc(dev, vif, info->enable_beacon);
++		mt7622_mcu_set_sta_rec_bmc(dev, vif, info->enable_beacon);
++		mt7622_mcu_set_bcn(dev, vif, info->enable_beacon);
++	}
++
++	mutex_unlock(&dev->mt76.mutex);
++}
++
++static void
++mt7622_channel_switch_beacon(struct ieee80211_hw *hw,
++			     struct ieee80211_vif *vif,
++			     struct cfg80211_chan_def *chandef)
++{
++	struct mt7622_dev *dev = hw->priv;
++
++	mutex_lock(&dev->mt76.mutex);
++	mt7622_mcu_set_bcn(dev, vif, true);
++	mutex_unlock(&dev->mt76.mutex);
++}
++
++int mt7622_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
++		   struct ieee80211_sta *sta)
++{
++	struct mt7622_dev *dev = container_of(mdev, struct mt7622_dev, mt76);
++	struct mt7622_sta *msta = (struct mt7622_sta *)sta->drv_priv;
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	int idx;
++
++	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7622_WTBL_STA - 1);
++	if (idx < 0)
++		return -ENOSPC;
++
++	msta->vif = mvif;
++	msta->wcid.sta = 1;
++	msta->wcid.idx = idx;
++
++	mt7622_mcu_add_wtbl(dev, vif, sta);
++	mt7622_mcu_set_sta_rec(dev, vif, sta, 1);
++
++	return 0;
++}
++
++void mt7622_sta_assoc(struct mt76_dev *mdev, struct ieee80211_vif *vif,
++		      struct ieee80211_sta *sta)
++{
++	struct mt7622_dev *dev = container_of(mdev, struct mt7622_dev, mt76);
++
++	if (sta->ht_cap.ht_supported)
++		mt7622_mcu_set_ht_cap(dev, vif, sta);
++}
++
++void mt7622_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
++		       struct ieee80211_sta *sta)
++{
++	struct mt7622_dev *dev = container_of(mdev, struct mt7622_dev, mt76);
++
++	mt7622_mcu_set_sta_rec(dev, vif, sta, 0);
++}
++
++static void mt7622_sta_rate_tbl_update(struct ieee80211_hw *hw,
++				       struct ieee80211_vif *vif,
++				       struct ieee80211_sta *sta)
++{
++	struct mt7622_dev *dev = hw->priv;
++	struct mt7622_sta *msta = (struct mt7622_sta *)sta->drv_priv;
++	struct ieee80211_sta_rates *sta_rates = rcu_dereference(sta->rates);
++	int i;
++
++	spin_lock_bh(&dev->mt76.lock);
++	for (i = 0; i < ARRAY_SIZE(msta->rates); i++) {
++		msta->rates[i].idx = sta_rates->rate[i].idx;
++		msta->rates[i].count = sta_rates->rate[i].count;
++		msta->rates[i].flags = sta_rates->rate[i].flags;
++
++		if (msta->rates[i].idx < 0 || !msta->rates[i].count)
++			break;
++	}
++	msta->n_rates = i;
++	mt7622_mac_set_rates(dev, msta, NULL, msta->rates);
++	msta->rate_probe = false;
++	spin_unlock_bh(&dev->mt76.lock);
++}
++
++static void
++mt7622_altx(struct mt76_dev *dev, struct ieee80211_sta *sta,
++	    struct mt76_wcid *wcid, struct sk_buff *skb)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	struct mt76_queue *q;
++
++	if (!(wcid->tx_info & MT_WCID_TX_INFO_SET))
++		ieee80211_get_tx_rates(info->control.vif, sta, skb,
++				       info->control.rates, 1);
++
++	q = dev->q_tx[MT_TXQ_PSD].q;
++
++	spin_lock_bh(&q->lock);
++	dev->queue_ops->tx_queue_skb(dev, MT_TXQ_PSD, skb, wcid, sta);
++	dev->queue_ops->kick(dev, q);
++
++	if (q->queued > q->ndesc - 8 && !q->stopped) {
++		ieee80211_stop_queue(dev->hw, skb_get_queue_mapping(skb));
++		q->stopped = true;
++	}
++
++	spin_unlock_bh(&q->lock);
++}
++
++static void mt7622_tx(struct ieee80211_hw *hw,
++		      struct ieee80211_tx_control *control,
++		      struct sk_buff *skb)
++{
++	struct mt7622_dev *dev = hw->priv;
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	struct ieee80211_vif *vif = info->control.vif;
++	struct mt76_wcid *wcid = &dev->mt76.global_wcid;
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++
++	if (control->sta) {
++		struct mt7622_sta *sta;
++
++		sta = (struct mt7622_sta *)control->sta->drv_priv;
++		wcid = &sta->wcid;
++	}
++
++	if (vif && !control->sta && ieee80211_is_data_qos(hdr->frame_control)) {
++		struct mt7622_vif *mvif;
++
++		mvif = (struct mt7622_vif *)vif->drv_priv;
++		wcid = &mvif->sta.wcid;
++	}
++
++	if (wcid->idx != dev->mt76.global_wcid.idx)
++		mt76_tx(&dev->mt76, control->sta, wcid, skb);
++	else
++		mt7622_altx(&dev->mt76, control->sta, wcid, skb);
++}
++
++static int mt7622_set_rts_threshold(struct ieee80211_hw *hw, u32 val)
++{
++	struct mt7622_dev *dev = hw->priv;
++
++	mutex_lock(&dev->mt76.mutex);
++	mt7622_mcu_set_rts_thresh(dev, val);
++	mutex_unlock(&dev->mt76.mutex);
++
++	return 0;
++}
++
++static int
++mt7622_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		    struct ieee80211_ampdu_params *params)
++{
++	enum ieee80211_ampdu_mlme_action action = params->action;
++	struct mt7622_dev *dev = hw->priv;
++	struct ieee80211_sta *sta = params->sta;
++	struct ieee80211_txq *txq = sta->txq[params->tid];
++	struct mt7622_sta *msta = (struct mt7622_sta *)sta->drv_priv;
++	u16 tid = params->tid;
++	u16 ssn = params->ssn;
++	struct mt76_txq *mtxq;
++
++	if (!txq)
++		return -EINVAL;
++
++	mtxq = (struct mt76_txq *)txq->drv_priv;
++
++	switch (action) {
++	case IEEE80211_AMPDU_RX_START:
++		mt76_rx_aggr_start(&dev->mt76, &msta->wcid, tid, ssn,
++				   params->buf_size);
++		mt7622_mcu_set_rx_ba(dev, params, 1);
++		break;
++	case IEEE80211_AMPDU_RX_STOP:
++		mt76_rx_aggr_stop(&dev->mt76, &msta->wcid, tid);
++		mt7622_mcu_set_rx_ba(dev, params, 0);
++		break;
++	case IEEE80211_AMPDU_TX_OPERATIONAL:
++		mtxq->aggr = true;
++		mtxq->send_bar = false;
++		mt7622_mcu_set_tx_ba(dev, params, 1);
++		break;
++	case IEEE80211_AMPDU_TX_STOP_FLUSH:
++	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
++		mtxq->aggr = false;
++		mt7622_mcu_set_tx_ba(dev, params, 0);
++		break;
++	case IEEE80211_AMPDU_TX_START:
++		mtxq->agg_ssn = IEEE80211_SN_TO_SEQ(ssn);
++		ieee80211_start_tx_ba_cb_irqsafe(vif, sta->addr, tid);
++		break;
++	case IEEE80211_AMPDU_TX_STOP_CONT:
++		mtxq->aggr = false;
++		mt7622_mcu_set_tx_ba(dev, params, 0);
++		ieee80211_stop_tx_ba_cb_irqsafe(vif, sta->addr, tid);
++		break;
++	}
++
++	return 0;
++}
++
++const struct ieee80211_ops mt7622_ops = {
++	.tx = mt7622_tx,
++	.start = mt7622_start,
++	.stop = mt7622_stop,
++	.add_interface = mt7622_add_interface,
++	.remove_interface = mt7622_remove_interface,
++	.config = mt7622_config,
++	.conf_tx = mt7622_conf_tx,
++	.configure_filter = mt7622_configure_filter,
++	.bss_info_changed = mt7622_bss_info_changed,
++	.sta_state = mt76_sta_state,
++	.set_key = mt7622_set_key,
++	.ampdu_action = mt7622_ampdu_action,
++	.set_rts_threshold = mt7622_set_rts_threshold,
++	.wake_tx_queue = mt76_wake_tx_queue,
++	.sta_rate_tbl_update = mt7622_sta_rate_tbl_update,
++	.sw_scan_start = mt76_sw_scan,
++	.sw_scan_complete = mt76_sw_scan_complete,
++	.release_buffered_frames = mt76_release_buffered_frames,
++	.get_txpower = mt76_get_txpower,
++	.channel_switch_beacon = mt7622_channel_switch_beacon,
++	.get_survey = mt76_get_survey,
++};
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/mcu.c b/drivers/net/wireless/mediatek/mt76_new/mt7622/mcu.c
+new file mode 100644
+index 00000000..c70884d
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/mcu.c
+@@ -0,0 +1,1557 @@
++// SPDX-License-Identifier: ISC
++/* Copyright (C) 2019 MediaTek Inc.
++ *
++ * Author: Roy Luo <royluo@google.com>
++ *         Ryder Lee <ryder.lee@mediatek.com>
++ */
++
++#include <linux/firmware.h>
++#include "mt7622.h"
++#include "mcu.h"
++#include "mac.h"
++#include "eeprom.h"
++
++struct mt7622_patch_hdr {
++	char build_date[16];
++	char platform[4];
++	__be32 hw_sw_ver;
++	__be32 patch_ver;
++	__be16 checksum;
++} __packed;
++
++struct mt7622_fw_trailer {
++	__le32 addr;
++	u8 chip_id;
++	u8 feature_set;
++	u8 eco_code;
++	char fw_ver[10];
++	char build_date[15];
++	__le32 len;
++} __packed;
++
++#define MT7622_PATCH_ADDRESS	0x9c000
++
++#define N9_REGION_NUM			2
++
++#define IMG_CRC_LEN			4
++
++#define FW_FEATURE_SET_ENCRYPT		BIT(0)
++#define FW_FEATURE_SET_KEY_IDX		GENMASK(2, 1)
++
++#define DL_MODE_ENCRYPT			BIT(0)
++#define DL_MODE_KEY_IDX			GENMASK(2, 1)
++#define DL_MODE_RESET_SEC_IV		BIT(3)
++#define DL_MODE_NEED_RSP		BIT(31)
++
++#define FW_START_OVERRIDE		BIT(0)
++
++#define HIF_INT_BASE			0x10000700
++#define HIF_INT_VAL 			BIT(1)
++
++static int __mt7622_mcu_msg_send(struct mt7622_dev *dev, struct sk_buff *skb,
++				 int cmd, int *wait_seq)
++{
++	struct mt7622_mcu_txd *mcu_txd;
++	u8 seq, q_idx, pkt_fmt;
++	enum mt76_txq_id qid;
++	u32 val;
++	__le32 *txd;
++
++	seq = ++dev->mt76.mmio.mcu.msg_seq & 0xf;
++	if (!seq)
++		seq = ++dev->mt76.mmio.mcu.msg_seq & 0xf;
++
++	mcu_txd = (struct mt7622_mcu_txd *)skb_push(skb,
++		   sizeof(struct mt7622_mcu_txd));
++	memset(mcu_txd, 0, sizeof(struct mt7622_mcu_txd));
++
++	if (cmd != -MCU_CMD_FW_SCATTER) {
++		q_idx = MT_TX_MCU_PORT_RX_Q0;
++		pkt_fmt = MT_TX_TYPE_CMD;
++	} else {
++		q_idx = MT_TX_MCU_PORT_RX_FWDL;
++		pkt_fmt = MT_TX_TYPE_FW;
++	}
++
++	txd = mcu_txd->txd;
++
++	val = FIELD_PREP(MT_TXD0_TX_BYTES, skb->len) |
++	      FIELD_PREP(MT_TXD0_P_IDX, MT_TX_PORT_IDX_MCU) |
++	      FIELD_PREP(MT_TXD0_Q_IDX, q_idx);
++	txd[0] = cpu_to_le32(val);
++
++	val = MT_TXD1_LONG_FORMAT |
++	      FIELD_PREP(MT_TXD1_HDR_FORMAT, MT_HDR_FORMAT_CMD) |
++	      FIELD_PREP(MT_TXD1_PKT_FMT, pkt_fmt);
++	txd[1] = cpu_to_le32(val);
++
++	mcu_txd->len = cpu_to_le16(skb->len - sizeof(mcu_txd->txd));
++	mcu_txd->pq_id = cpu_to_le16(MCU_PQ_ID(MT_TX_PORT_IDX_MCU, q_idx));
++	mcu_txd->pkt_type = MCU_PKT_ID;
++	mcu_txd->seq = seq;
++
++	if (cmd < 0) {
++		mcu_txd->set_query = MCU_Q_NA;
++		mcu_txd->cid = -cmd;
++	} else {
++		mcu_txd->cid = MCU_CMD_EXT_CID;
++		mcu_txd->set_query = MCU_Q_SET;
++		mcu_txd->ext_cid = cmd;
++		mcu_txd->ext_cid_ack = 1;
++	}
++	mcu_txd->s2d_index = MCU_S2D_H2N;
++
++	if (wait_seq)
++		*wait_seq = seq;
++
++	if (test_bit(MT76_STATE_MCU_RUNNING, &dev->mt76.state))
++		qid = MT_TXQ_MCU;
++	else
++		qid = MT_TXQ_FWDL;
++
++	return mt76_tx_queue_skb_raw(dev, qid, skb, 0);
++}
++
++static int
++mt7622_mcu_parse_response(struct mt7622_dev *dev, int cmd,
++			  struct sk_buff *skb, int seq)
++{
++	struct mt7622_mcu_rxd *rxd = (struct mt7622_mcu_rxd *)skb->data;
++	int ret = 0;
++
++	if (seq != rxd->seq)
++		return -EAGAIN;
++
++	switch (cmd) {
++	case -MCU_CMD_PATCH_SEM_CONTROL:
++		skb_pull(skb, sizeof(*rxd) - 4);
++		ret = *skb->data;
++		break;
++	case MCU_EXT_CMD_GET_TEMP:
++		skb_pull(skb, sizeof(*rxd));
++		ret = le32_to_cpu(*(__le32 *)skb->data);
++		break;
++	default:
++		break;
++	}
++	dev_kfree_skb(skb);
++
++	return ret;
++}
++
++static int
++mt7622_mcu_msg_send(struct mt76_dev *mdev, int cmd, const void *data,
++		    int len, bool wait_resp)
++{
++	struct mt7622_dev *dev = container_of(mdev, struct mt7622_dev, mt76);
++	unsigned long expires = jiffies + 10 * HZ;
++	struct sk_buff *skb;
++	int ret, seq;
++
++	skb = mt7622_mcu_msg_alloc(data, len);
++	if (!skb)
++		return -ENOMEM;
++
++	mutex_lock(&mdev->mmio.mcu.mutex);
++
++	ret = __mt7622_mcu_msg_send(dev, skb, cmd, &seq);
++	if (ret)
++		goto out;
++
++	while (wait_resp) {
++		skb = mt76_mcu_get_response(mdev, expires);
++		if (!skb) {
++			dev_err(mdev->dev, "Message %d (seq %d) timeout\n",
++				cmd, seq);
++			ret = -ETIMEDOUT;
++			break;
++		}
++
++		ret = mt7622_mcu_parse_response(dev, cmd, skb, seq);
++		if (ret != -EAGAIN)
++			break;
++	}
++
++out:
++	mutex_unlock(&mdev->mmio.mcu.mutex);
++
++	return ret;
++}
++
++static void
++mt7622_mcu_csa_finish(void *priv, u8 *mac, struct ieee80211_vif *vif)
++{
++	if (vif->csa_active)
++		ieee80211_csa_finish(vif);
++}
++
++static void
++mt7622_mcu_rx_ext_event(struct mt7622_dev *dev, struct sk_buff *skb)
++{
++	struct mt7622_mcu_rxd *rxd = (struct mt7622_mcu_rxd *)skb->data;
++
++	switch (rxd->ext_eid) {
++	case MCU_EXT_EVENT_CSA_NOTIFY:
++		ieee80211_iterate_active_interfaces_atomic(dev->mt76.hw,
++				IEEE80211_IFACE_ITER_RESUME_ALL,
++				mt7622_mcu_csa_finish, dev);
++		break;
++	default:
++		break;
++	}
++}
++
++static void
++mt7622_mcu_rx_unsolicited_event(struct mt7622_dev *dev, struct sk_buff *skb)
++{
++	struct mt7622_mcu_rxd *rxd = (struct mt7622_mcu_rxd *)skb->data;
++
++	switch (rxd->eid) {
++	case MCU_EVENT_EXT:
++		mt7622_mcu_rx_ext_event(dev, skb);
++		break;
++	default:
++		break;
++	}
++	dev_kfree_skb(skb);
++}
++
++void mt7622_mcu_rx_event(struct mt7622_dev *dev, struct sk_buff *skb)
++{
++	struct mt7622_mcu_rxd *rxd = (struct mt7622_mcu_rxd *)skb->data;
++
++	if (rxd->ext_eid == MCU_EXT_EVENT_THERMAL_PROTECT ||
++	    rxd->ext_eid == MCU_EXT_EVENT_FW_LOG_2_HOST ||
++	    rxd->ext_eid == MCU_EXT_EVENT_ASSERT_DUMP ||
++	    rxd->ext_eid == MCU_EXT_EVENT_PS_SYNC ||
++	    !rxd->seq)
++		mt7622_mcu_rx_unsolicited_event(dev, skb);
++	else
++		mt76_mcu_rx_event(&dev->mt76, skb);
++}
++
++static int mt7622_mcu_init_download(struct mt7622_dev *dev, u32 addr,
++				    u32 len, u32 mode)
++{
++	struct {
++		__le32 addr;
++		__le32 len;
++		__le32 mode;
++	} req = {
++		.addr = cpu_to_le32(addr),
++		.len = cpu_to_le32(len),
++		.mode = cpu_to_le32(mode),
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_TARGET_ADDRESS_LEN_REQ,
++				   &req, sizeof(req), true);
++}
++
++static int mt7622_mcu_send_firmware(struct mt7622_dev *dev, const void *data,
++				    int len)
++{
++	int ret = 0, cur_len;
++
++	while (len > 0) {
++		cur_len = min_t(int, 4096 - sizeof(struct mt7622_mcu_txd),
++				len);
++
++		ret = __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_FW_SCATTER,
++					  data, cur_len, false);
++		if (ret)
++			break;
++
++		data += cur_len;
++		len -= cur_len;
++		mt76_queue_tx_cleanup(dev, MT_TXQ_FWDL, false);
++	}
++
++	return ret;
++}
++
++static int mt7622_mcu_start_firmware(struct mt7622_dev *dev, u32 addr,
++				     u32 option)
++{
++	struct {
++		__le32 option;
++		__le32 addr;
++	} req = {
++		.option = cpu_to_le32(option),
++		.addr = cpu_to_le32(addr),
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_FW_START_REQ,
++				   &req, sizeof(req), true);
++}
++
++static int mt7622_mcu_restart(struct mt76_dev *dev)
++{
++	return __mt76_mcu_send_msg(dev, -MCU_CMD_RESTART_DL_REQ, NULL,
++				   0, true);
++}
++
++static int mt7622_mcu_patch_sem_ctrl(struct mt7622_dev *dev, bool get)
++{
++	struct {
++		__le32 op;
++	} req = {
++		.op = cpu_to_le32(get ? PATCH_SEM_GET : PATCH_SEM_RELEASE),
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_PATCH_SEM_CONTROL,
++				   &req, sizeof(req), true);
++}
++
++static int mt7622_mcu_start_patch(struct mt7622_dev *dev)
++{
++	struct {
++		u8 check_crc;
++		u8 reserved[3];
++	} req = {
++		.check_crc = 0,
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_PATCH_FINISH_REQ,
++				   &req, sizeof(req), true);
++}
++
++static void mt7622_trigger_hif_int(bool enable)
++{
++	void __iomem *addr = ioremap(HIF_INT_BASE, 16);
++	unsigned int val = readl(addr);
++
++	if (enable)
++		val &= ~HIF_INT_VAL;
++	else
++		val |= HIF_INT_VAL;
++
++	writel(val, addr);
++	iounmap(addr);
++}
++
++static int mt7622_driver_own(struct mt7622_dev *dev)
++{
++	mt76_wr(dev, MT_CFG_LPCR_HOST(dev), MT_CFG_LPCR_HOST_DRV_OWN);
++
++	/* trigger hif interrupt to MCU */
++	mt7622_trigger_hif_int(true);
++	if (!mt76_poll_msec(dev, MT_CFG_LPCR_HOST(dev),
++			    MT_CFG_LPCR_HOST_FW_OWN, 0, 3000)) {
++		dev_err(dev->mt76.dev, "Timeout for driver own\n");
++		return -EIO;
++	}
++	mt7622_trigger_hif_int(false);
++
++	dev_info(dev->mt76.dev, "Driver own success\n");
++	return 0;
++}
++
++static int mt7622_load_patch(struct mt7622_dev *dev)
++{
++	const struct mt7622_patch_hdr *hdr;
++	const struct firmware *fw = NULL;
++	int len, ret, sem;
++
++	sem = mt7622_mcu_patch_sem_ctrl(dev, 1);
++	switch (sem) {
++	case PATCH_IS_DL:
++		return 0;
++	case PATCH_NOT_DL_SEM_SUCCESS:
++		break;
++	default:
++		dev_err(dev->mt76.dev, "Failed to get patch semaphore\n");
++		return -EAGAIN;
++	}
++
++	ret = request_firmware(&fw, MT7622_ROM_PATCH, dev->mt76.dev);
++	if (ret)
++		goto out;
++
++	if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
++		dev_err(dev->mt76.dev, "Invalid firmware\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	hdr = (const struct mt7622_patch_hdr *)(fw->data);
++
++	dev_info(dev->mt76.dev, "HW/SW Version: 0x%x, Build Time: %.16s\n",
++		 be32_to_cpu(hdr->hw_sw_ver), hdr->build_date);
++
++	len = fw->size - sizeof(*hdr);
++
++	ret = mt7622_mcu_init_download(dev, MT7622_PATCH_ADDRESS, len,
++				       DL_MODE_NEED_RSP);
++	if (ret) {
++		dev_err(dev->mt76.dev, "Download request failed\n");
++		goto out;
++	}
++
++	ret = mt7622_mcu_send_firmware(dev, fw->data + sizeof(*hdr), len);
++	if (ret) {
++		dev_err(dev->mt76.dev, "Failed to send firmware to device\n");
++		goto out;
++	}
++
++	ret = mt7622_mcu_start_patch(dev);
++	if (ret)
++		dev_err(dev->mt76.dev, "Failed to start patch\n");
++
++out:
++	release_firmware(fw);
++
++	sem = mt7622_mcu_patch_sem_ctrl(dev, 0);
++	switch (sem) {
++	case PATCH_REL_SEM_SUCCESS:
++		break;
++	default:
++		ret = -EAGAIN;
++		dev_err(dev->mt76.dev, "Failed to release patch semaphore\n");
++		break;
++	}
++
++	return ret;
++}
++
++static u32 mt7622_mcu_gen_dl_mode(u8 feature_set)
++{
++	u32 ret = 0;
++
++	ret |= (feature_set & FW_FEATURE_SET_ENCRYPT) ?
++	       (DL_MODE_ENCRYPT | DL_MODE_RESET_SEC_IV) : 0;
++	ret |= FIELD_PREP(DL_MODE_KEY_IDX,
++			  FIELD_GET(FW_FEATURE_SET_KEY_IDX, feature_set));
++	ret |= DL_MODE_NEED_RSP;
++
++	return ret;
++}
++
++static int
++mt7622_mcu_send_ram_firmware(struct mt7622_dev *dev,
++			     const struct mt7622_fw_trailer *hdr,
++			     const u8 *data)
++{
++	int err, i, offset = 0;
++	u32 len, addr, mode;
++
++	for (i = 0; i < N9_REGION_NUM; i++) {
++		mode = mt7622_mcu_gen_dl_mode(hdr[i].feature_set);
++		len = le32_to_cpu(hdr[i].len) + IMG_CRC_LEN;
++		addr = le32_to_cpu(hdr[i].addr);
++
++		err = mt7622_mcu_init_download(dev, addr, len, mode);
++		if (err) {
++			dev_err(dev->mt76.dev, "Download request failed\n");
++			return err;
++		}
++
++		err = mt7622_mcu_send_firmware(dev, data + offset, len);
++		if (err) {
++			dev_err(dev->mt76.dev, "Failed to send firmware to device\n");
++			return err;
++		}
++
++		offset += len;
++	}
++
++	return 0;
++}
++
++static int mt7622_load_ram(struct mt7622_dev *dev)
++{
++	const struct mt7622_fw_trailer *hdr;
++	const struct firmware *fw;
++	int ret;
++
++	ret = request_firmware(&fw, MT7622_FIRMWARE_N9, dev->mt76.dev);
++	if (ret)
++		return ret;
++
++	if (!fw || !fw->data || fw->size < N9_REGION_NUM * sizeof(*hdr)) {
++		dev_err(dev->mt76.dev, "Invalid firmware\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	hdr = (const struct mt7622_fw_trailer *)(fw->data + fw->size -
++					N9_REGION_NUM * sizeof(*hdr));
++
++	dev_info(dev->mt76.dev, "N9 Firmware Version: %.10s, Build Time: %.15s\n",
++		 hdr->fw_ver, hdr->build_date);
++
++	ret = mt7622_mcu_send_ram_firmware(dev, hdr, fw->data);
++	if (ret)
++		goto out;
++
++	ret = mt7622_mcu_start_firmware(dev, le32_to_cpu(hdr->addr),
++					FW_START_OVERRIDE);
++	if (ret) {
++		dev_err(dev->mt76.dev, "Failed to start N9 firmware\n");
++		goto out;
++	}
++
++out:
++	release_firmware(fw);
++
++	return ret;
++}
++
++static void fwdl_datapath_setup(struct mt7622_dev *dev, bool init)
++{
++	u32 val;
++
++	val = mt76_rr(dev, MT_WPDMA_GLO_CFG(dev));
++	if (init)
++		val |= MT_WPDMA_GLO_CFG_FW_RING_BP_TX_SCH;
++	else
++		val &= ~MT_WPDMA_GLO_CFG_FW_RING_BP_TX_SCH;
++
++	mt76_wr(dev, MT_WPDMA_GLO_CFG(dev), val);
++}
++
++static int mt7622_load_firmware(struct mt7622_dev *dev)
++{
++	int ret;
++	u32 val;
++
++	fwdl_datapath_setup(dev, true);
++
++	val = mt76_get_field(dev, MT_TOP_OFF_RSV, MT_TOP_OFF_RSV_FW_STATE);
++
++	if (val != FW_STATE_FW_DOWNLOAD) {
++		dev_err(dev->mt76.dev, "Firmware is not ready for download\n");
++		return -EIO;
++	}
++
++	ret = mt7622_load_patch(dev);
++	if (ret)
++		return ret;
++
++	ret = mt7622_load_ram(dev);
++	if (ret)
++		return ret;
++
++	if (!mt76_poll_msec(dev, MT_TOP_OFF_RSV, MT_TOP_OFF_RSV_FW_STATE,
++			    FIELD_PREP(MT_TOP_OFF_RSV_FW_STATE, FW_STATE_NORMAL_TRX), 1500)) {
++		dev_err(dev->mt76.dev, "Timeout for initializing firmware\n");
++		return -EIO;
++	}
++	val = mt76_get_field(dev, MT_TOP_OFF_RSV,
++					MT_TOP_OFF_RSV_FW_STATE);
++
++	mt76_queue_tx_cleanup(dev, MT_TXQ_FWDL, false);
++
++	dev_info(dev->mt76.dev, "Firmware init done\n");
++
++	fwdl_datapath_setup(dev, false);
++
++	return 0;
++}
++
++int mt7622_mcu_init(struct mt7622_dev *dev)
++{
++	static const struct mt76_mcu_ops mt7622_mcu_ops = {
++		.mcu_send_msg = mt7622_mcu_msg_send,
++		.mcu_restart = mt7622_mcu_restart,
++	};
++	int ret;
++
++	dev->mt76.mcu_ops = &mt7622_mcu_ops,
++
++	ret = mt7622_load_firmware(dev);
++	if (ret)
++		return ret;
++
++	ret = mt7622_driver_own(dev);
++	if (ret)
++		return ret;
++
++	set_bit(MT76_STATE_MCU_RUNNING, &dev->mt76.state);
++
++	return 0;
++}
++
++void mt7622_mcu_exit(struct mt7622_dev *dev)
++{
++	__mt76_mcu_restart(&dev->mt76);
++	mt76_wr(dev, MT_CFG_LPCR_HOST(dev), MT_CFG_LPCR_HOST_FW_OWN);
++	skb_queue_purge(&dev->mt76.mmio.mcu.res_q);
++}
++
++int mt7622_mcu_set_eeprom(struct mt7622_dev *dev)
++{
++	struct {
++		u8 buffer_mode;
++		u8 content_format;
++		u16 len;
++	} __packed req_hdr = {
++		.buffer_mode = 1,
++		.len = __MT_EE_MAX - MT_EE_NIC_CONF_0,
++	};
++	int ret, len = sizeof(req_hdr) + __MT_EE_MAX - MT_EE_NIC_CONF_0;
++	u8 *req, *eep = (u8 *)dev->mt76.eeprom.data;
++
++	req = kzalloc(len, GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
++
++	memcpy(req, &req_hdr, sizeof(req_hdr));
++	memcpy(req + sizeof(req_hdr), eep + MT_EE_NIC_CONF_0,
++	       __MT_EE_MAX - MT_EE_NIC_CONF_0);
++
++	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_EFUSE_BUFFER_MODE,
++				  req, len, true);
++	kfree(req);
++
++	return ret;
++}
++
++int mt7622_mcu_init_mac(struct mt7622_dev *dev)
++{
++	struct {
++		u8 enable;
++		u8 band;
++		u8 rsv[2];
++	} __packed req = {
++		.enable = 1,
++		.band = 0,
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_MAC_INIT_CTRL,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_set_rts_thresh(struct mt7622_dev *dev, u32 val)
++{
++	struct {
++		u8 prot_idx;
++		u8 band;
++		u8 rsv[2];
++		__le32 len_thresh;
++		__le32 pkt_thresh;
++	} __packed req = {
++		.prot_idx = 1,
++		.band = 0,
++		.len_thresh = cpu_to_le32(val),
++		.pkt_thresh = cpu_to_le32(0x2),
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_PROTECT_CTRL,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_set_wmm(struct mt7622_dev *dev, u8 queue,
++		       const struct ieee80211_tx_queue_params *params)
++{
++#define WMM_AIFS_SET	BIT(0)
++#define WMM_CW_MIN_SET	BIT(1)
++#define WMM_CW_MAX_SET	BIT(2)
++#define WMM_TXOP_SET	BIT(3)
++#define WMM_PARAM_SET	(WMM_AIFS_SET | WMM_CW_MIN_SET | \
++			 WMM_CW_MAX_SET | WMM_TXOP_SET)
++	struct req_data {
++		u8 number;
++		u8 rsv[3];
++		u8 queue;
++		u8 valid;
++		u8 aifs;
++		u8 cw_min;
++		__le16 cw_max;
++		__le16 txop;
++	} __packed req = {
++		.number = 1,
++		.queue = queue,
++		.valid = WMM_PARAM_SET,
++		.aifs = params->aifs,
++		.cw_min = 5,
++		.cw_max = cpu_to_le16(10),
++		.txop = cpu_to_le16(params->txop),
++	};
++
++	if (params->cw_min)
++		req.cw_min = fls(params->cw_min);
++	if (params->cw_max)
++		req.cw_max = cpu_to_le16(fls(params->cw_max));
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_EDCA_UPDATE,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_ctrl_pm_state(struct mt7622_dev *dev, int enter)
++{
++#define ENTER_PM_STATE	1
++#define EXIT_PM_STATE	2
++	struct {
++		u8 pm_number;
++		u8 pm_state;
++		u8 bssid[ETH_ALEN];
++		u8 dtim_period;
++		u8 wlan_idx;
++		__le16 bcn_interval;
++		__le32 aid;
++		__le32 rx_filter;
++		u8 band_idx;
++		u8 rsv[3];
++		__le32 feature;
++		u8 omac_idx;
++		u8 wmm_idx;
++		u8 bcn_loss_cnt;
++		u8 bcn_sp_duration;
++	} __packed req = {
++		.pm_number = 5,
++		.pm_state = (enter) ? ENTER_PM_STATE : EXIT_PM_STATE,
++		.band_idx = 0,
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_PM_STATE_CTRL,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_set_dev_info(struct mt7622_dev *dev,
++			    struct ieee80211_vif *vif, bool enable)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct {
++		struct req_hdr {
++			u8 omac_idx;
++			u8 band_idx;
++			__le16 tlv_num;
++			u8 is_tlv_append;
++			u8 rsv[3];
++		} __packed hdr;
++		struct req_tlv {
++			__le16 tag;
++			__le16 len;
++			u8 active;
++			u8 band_idx;
++			u8 omac_addr[ETH_ALEN];
++		} __packed tlv;
++	} data = {
++		.hdr = {
++			.omac_idx = mvif->omac_idx,
++			.band_idx = mvif->band_idx,
++			.tlv_num = cpu_to_le16(1),
++			.is_tlv_append = 1,
++		},
++		.tlv = {
++			.tag = cpu_to_le16(DEV_INFO_ACTIVE),
++			.len = cpu_to_le16(sizeof(struct req_tlv)),
++			.active = enable,
++			.band_idx = mvif->band_idx,
++		},
++	};
++
++	memcpy(data.tlv.omac_addr, vif->addr, ETH_ALEN);
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_DEV_INFO_UPDATE,
++				   &data, sizeof(data), true);
++}
++
++static void
++mt7622_mcu_bss_info_omac_header(struct mt7622_vif *mvif, u8 *data,
++				u32 conn_type)
++{
++	struct bss_info_omac *hdr = (struct bss_info_omac *)data;
++	u8 idx;
++
++	idx = mvif->omac_idx > EXT_BSSID_START ? HW_BSSID_0 : mvif->omac_idx;
++	hdr->tag = cpu_to_le16(BSS_INFO_OMAC);
++	hdr->len = cpu_to_le16(sizeof(struct bss_info_omac));
++	hdr->hw_bss_idx = idx;
++	hdr->omac_idx = mvif->omac_idx;
++	hdr->band_idx = mvif->band_idx;
++	hdr->conn_type = cpu_to_le32(conn_type);
++}
++
++static void
++mt7622_mcu_bss_info_basic_header(struct ieee80211_vif *vif, u8 *data,
++				 u32 net_type, u8 tx_wlan_idx,
++				 bool enable)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct bss_info_basic *hdr = (struct bss_info_basic *)data;
++
++	hdr->tag = cpu_to_le16(BSS_INFO_BASIC);
++	hdr->len = cpu_to_le16(sizeof(struct bss_info_basic));
++	hdr->network_type = cpu_to_le32(net_type);
++	hdr->active = enable;
++	hdr->bcn_interval = cpu_to_le16(vif->bss_conf.beacon_int);
++	memcpy(hdr->bssid, vif->bss_conf.bssid, ETH_ALEN);
++	hdr->wmm_idx = mvif->wmm_idx;
++	hdr->dtim_period = vif->bss_conf.dtim_period;
++	hdr->bmc_tx_wlan_idx = tx_wlan_idx;
++}
++
++static void
++mt7622_mcu_bss_info_ext_header(struct mt7622_vif *mvif, u8 *data)
++{
++/* SIFS 20us + 512 byte beacon tranmitted by 1Mbps (3906us) */
++#define BCN_TX_ESTIMATE_TIME (4096 + 20)
++	struct bss_info_ext_bss *hdr = (struct bss_info_ext_bss *)data;
++	int ext_bss_idx, tsf_offset;
++
++	ext_bss_idx = mvif->omac_idx - EXT_BSSID_START;
++	if (ext_bss_idx < 0)
++		return;
++
++	hdr->tag = cpu_to_le16(BSS_INFO_EXT_BSS);
++	hdr->len = cpu_to_le16(sizeof(struct bss_info_ext_bss));
++	tsf_offset = ext_bss_idx * BCN_TX_ESTIMATE_TIME;
++	hdr->mbss_tsf_offset = cpu_to_le32(tsf_offset);
++}
++
++int mt7622_mcu_set_bss_info(struct mt7622_dev *dev,
++			    struct ieee80211_vif *vif, int en)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct req_hdr {
++		u8 bss_idx;
++		u8 rsv0;
++		__le16 tlv_num;
++		u8 is_tlv_append;
++		u8 rsv1[3];
++	} __packed;
++	int len = sizeof(struct req_hdr) + sizeof(struct bss_info_basic);
++	int ret, i, features = BIT(BSS_INFO_BASIC), ntlv = 1;
++	u32 conn_type = 0, net_type = NETWORK_INFRA;
++	u8 *buf, *data, tx_wlan_idx = 0;
++	struct req_hdr *hdr;
++
++	if (en) {
++		len += sizeof(struct bss_info_omac);
++		features |= BIT(BSS_INFO_OMAC);
++		if (mvif->omac_idx > EXT_BSSID_START) {
++			len += sizeof(struct bss_info_ext_bss);
++			features |= BIT(BSS_INFO_EXT_BSS);
++			ntlv++;
++		}
++		ntlv++;
++	}
++
++	switch (vif->type) {
++	case NL80211_IFTYPE_AP:
++	case NL80211_IFTYPE_MESH_POINT:
++		tx_wlan_idx = mvif->sta.wcid.idx;
++		conn_type = CONNECTION_INFRA_AP;
++		break;
++	case NL80211_IFTYPE_STATION: {
++		/* TODO: enable BSS_INFO_UAPSD & BSS_INFO_PM */
++		if (en) {
++			struct ieee80211_sta *sta;
++			struct mt7622_sta *msta;
++
++			rcu_read_lock();
++			sta = ieee80211_find_sta(vif, vif->bss_conf.bssid);
++			if (!sta) {
++				rcu_read_unlock();
++				return -EINVAL;
++			}
++
++			msta = (struct mt7622_sta *)sta->drv_priv;
++			tx_wlan_idx = msta->wcid.idx;
++			rcu_read_unlock();
++		}
++		conn_type = CONNECTION_INFRA_STA;
++		break;
++	}
++	default:
++		WARN_ON(1);
++		break;
++	}
++
++	buf = kzalloc(len, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	hdr = (struct req_hdr *)buf;
++	hdr->bss_idx = mvif->idx;
++	hdr->tlv_num = cpu_to_le16(ntlv);
++	hdr->is_tlv_append = 1;
++
++	data = buf + sizeof(*hdr);
++	for (i = 0; i < BSS_INFO_MAX_NUM; i++) {
++		int tag = ffs(features & BIT(i)) - 1;
++
++		switch (tag) {
++		case BSS_INFO_OMAC:
++			mt7622_mcu_bss_info_omac_header(mvif, data,
++							conn_type);
++			data += sizeof(struct bss_info_omac);
++			break;
++		case BSS_INFO_BASIC:
++			mt7622_mcu_bss_info_basic_header(vif, data, net_type,
++							 tx_wlan_idx, en);
++			data += sizeof(struct bss_info_basic);
++			break;
++		case BSS_INFO_EXT_BSS:
++			mt7622_mcu_bss_info_ext_header(mvif, data);
++			data += sizeof(struct bss_info_ext_bss);
++			break;
++		default:
++			break;
++		}
++	}
++
++	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_BSS_INFO_UPDATE,
++				  buf, len, true);
++	kfree(buf);
++
++	return ret;
++}
++
++static int
++mt7622_mcu_add_wtbl_bmc(struct mt7622_dev *dev,
++			struct mt7622_vif *mvif)
++{
++	struct {
++		struct wtbl_req_hdr hdr;
++		struct wtbl_generic g_wtbl;
++		struct wtbl_rx rx_wtbl;
++	} req = {
++		.hdr = {
++			.wlan_idx = mvif->sta.wcid.idx,
++			.operation = WTBL_RESET_AND_SET,
++			.tlv_num = cpu_to_le16(2),
++		},
++		.g_wtbl = {
++			.tag = cpu_to_le16(WTBL_GENERIC),
++			.len = cpu_to_le16(sizeof(struct wtbl_generic)),
++			.muar_idx = 0xe,
++		},
++		.rx_wtbl = {
++			.tag = cpu_to_le16(WTBL_RX),
++			.len = cpu_to_le16(sizeof(struct wtbl_rx)),
++			.rca1 = 1,
++			.rca2 = 1,
++			.rv = 1,
++		},
++	};
++	eth_broadcast_addr(req.g_wtbl.peer_addr);
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_WTBL_UPDATE,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_wtbl_bmc(struct mt7622_dev *dev,
++			struct ieee80211_vif *vif, bool enable)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++
++	if (!enable) {
++		struct wtbl_req_hdr req = {
++			.wlan_idx = mvif->sta.wcid.idx,
++			.operation = WTBL_RESET_AND_SET,
++		};
++
++		return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_WTBL_UPDATE,
++					   &req, sizeof(req), true);
++	}
++
++	return mt7622_mcu_add_wtbl_bmc(dev, mvif);
++}
++
++int mt7622_mcu_add_wtbl(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++			struct ieee80211_sta *sta)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct mt7622_sta *msta = (struct mt7622_sta *)sta->drv_priv;
++	struct {
++		struct wtbl_req_hdr hdr;
++		struct wtbl_generic g_wtbl;
++		struct wtbl_rx rx_wtbl;
++	} req = {
++		.hdr = {
++			.wlan_idx = msta->wcid.idx,
++			.operation = WTBL_RESET_AND_SET,
++			.tlv_num = cpu_to_le16(2),
++		},
++		.g_wtbl = {
++			.tag = cpu_to_le16(WTBL_GENERIC),
++			.len = cpu_to_le16(sizeof(struct wtbl_generic)),
++			.muar_idx = mvif->omac_idx,
++			.qos = sta->wme,
++			.partial_aid = cpu_to_le16(sta->aid),
++		},
++		.rx_wtbl = {
++			.tag = cpu_to_le16(WTBL_RX),
++			.len = cpu_to_le16(sizeof(struct wtbl_rx)),
++			.rca1 = vif->type != NL80211_IFTYPE_AP,
++			.rca2 = 1,
++			.rv = 1,
++		},
++	};
++	memcpy(req.g_wtbl.peer_addr, sta->addr, ETH_ALEN);
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_WTBL_UPDATE,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_del_wtbl(struct mt7622_dev *dev,
++			struct ieee80211_sta *sta)
++{
++	struct mt7622_sta *msta = (struct mt7622_sta *)sta->drv_priv;
++	struct wtbl_req_hdr req = {
++		.wlan_idx = msta->wcid.idx,
++		.operation = WTBL_RESET_AND_SET,
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_WTBL_UPDATE,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_del_wtbl_all(struct mt7622_dev *dev)
++{
++	struct wtbl_req_hdr req = {
++		.operation = WTBL_RESET_ALL,
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_WTBL_UPDATE,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_set_sta_rec_bmc(struct mt7622_dev *dev,
++			       struct ieee80211_vif *vif, bool en)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct {
++		struct sta_req_hdr hdr;
++		struct sta_rec_basic basic;
++	} req = {
++		.hdr = {
++			.bss_idx = mvif->idx,
++			.wlan_idx = mvif->sta.wcid.idx,
++			.tlv_num = cpu_to_le16(1),
++			.is_tlv_append = 1,
++			.muar_idx = mvif->omac_idx,
++		},
++		.basic = {
++			.tag = cpu_to_le16(STA_REC_BASIC),
++			.len = cpu_to_le16(sizeof(struct sta_rec_basic)),
++			.conn_type = cpu_to_le32(CONNECTION_INFRA_BC),
++		},
++	};
++	eth_broadcast_addr(req.basic.peer_addr);
++
++	if (en) {
++		req.basic.conn_state = CONN_STATE_PORT_SECURE;
++		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER |
++						   EXTRA_INFO_NEW);
++	} else {
++		req.basic.conn_state = CONN_STATE_DISCONNECT;
++		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER);
++	}
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_STA_REC_UPDATE,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_set_sta_rec(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++			   struct ieee80211_sta *sta, bool en)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct mt7622_sta *msta = (struct mt7622_sta *)sta->drv_priv;
++
++	struct {
++		struct sta_req_hdr hdr;
++		struct sta_rec_basic basic;
++	} req = {
++		.hdr = {
++			.bss_idx = mvif->idx,
++			.wlan_idx = msta->wcid.idx,
++			.tlv_num = cpu_to_le16(1),
++			.is_tlv_append = 1,
++			.muar_idx = mvif->omac_idx,
++		},
++		.basic = {
++			.tag = cpu_to_le16(STA_REC_BASIC),
++			.len = cpu_to_le16(sizeof(struct sta_rec_basic)),
++			.qos = sta->wme,
++			.aid = cpu_to_le16(sta->aid),
++		},
++	};
++	memcpy(req.basic.peer_addr, sta->addr, ETH_ALEN);
++
++	switch (vif->type) {
++	case NL80211_IFTYPE_AP:
++	case NL80211_IFTYPE_MESH_POINT:
++		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_STA);
++		break;
++	case NL80211_IFTYPE_STATION:
++		req.basic.conn_type = cpu_to_le32(CONNECTION_INFRA_AP);
++		break;
++	default:
++		WARN_ON(1);
++		break;
++	}
++
++	if (en) {
++		req.basic.conn_state = CONN_STATE_PORT_SECURE;
++		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER |
++						   EXTRA_INFO_NEW);
++	} else {
++		req.basic.conn_state = CONN_STATE_DISCONNECT;
++		req.basic.extra_info = cpu_to_le16(EXTRA_INFO_VER);
++	}
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_STA_REC_UPDATE,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_set_bcn(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++		       int en)
++{
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct mt76_wcid *wcid = &dev->mt76.global_wcid;
++	struct ieee80211_mutable_offsets offs;
++	struct req {
++		u8 omac_idx;
++		u8 enable;
++		u8 wlan_idx;
++		u8 band_idx;
++		u8 pkt_type;
++		u8 need_pre_tbtt_int;
++		__le16 csa_ie_pos;
++		__le16 pkt_len;
++		__le16 tim_ie_pos;
++		u8 pkt[512];
++		u8 csa_cnt;
++		/* bss color change */
++		u8 bcc_cnt;
++		__le16 bcc_ie_pos;
++	} __packed req = {
++		.omac_idx = mvif->omac_idx,
++		.enable = en,
++		.wlan_idx = wcid->idx,
++		.band_idx = mvif->band_idx,
++	};
++	struct sk_buff *skb;
++
++	skb = ieee80211_beacon_get_template(mt76_hw(dev), vif, &offs);
++	if (!skb)
++		return -EINVAL;
++
++	if (skb->len > 512 - MT_TXD_SIZE) {
++		dev_err(dev->mt76.dev, "Bcn size limit exceed\n");
++		dev_kfree_skb(skb);
++		return -EINVAL;
++	}
++
++	mt7622_mac_write_txwi(dev, (__le32 *)(req.pkt), skb, MT_TXQ_BEACON,
++			wcid, NULL, 0, NULL);
++	memcpy(req.pkt + MT_TXD_SIZE, skb->data, skb->len);
++	req.pkt_len = cpu_to_le16(MT_TXD_SIZE + skb->len);
++	req.tim_ie_pos = cpu_to_le16(MT_TXD_SIZE + offs.tim_offset);
++	if (offs.csa_counter_offs[0]) {
++		u16 csa_offs;
++
++		csa_offs = MT_TXD_SIZE + offs.csa_counter_offs[0] - 4;
++		req.csa_ie_pos = cpu_to_le16(csa_offs);
++		req.csa_cnt = skb->data[offs.csa_counter_offs[0]];
++	}
++	dev_kfree_skb(skb);
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_BCN_OFFLOAD,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_set_tx_power(struct mt7622_dev *dev)
++{
++	int i, ret, n_chains = hweight8(dev->mt76.antenna_mask);
++	struct cfg80211_chan_def *chandef = &dev->mt76.chandef;
++	int freq = chandef->center_freq1, len;
++	u8 *req, *data, *eep = (u8 *)dev->mt76.eeprom.data;
++	enum nl80211_band band = chandef->chan->band;
++	struct ieee80211_hw *hw = mt76_hw(dev);
++	struct {
++		u8 center_chan;
++		u8 dbdc_idx;
++		u8 band;
++		u8 rsv;
++	} __packed req_hdr = {
++		.center_chan = ieee80211_frequency_to_channel(freq),
++		.band = band,
++	};
++	s8 tx_power;
++
++	len = sizeof(req_hdr) + __MT_EE_MAX - MT_EE_NIC_CONF_0;
++	req = kzalloc(len, GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
++
++	memcpy(req, &req_hdr, sizeof(req_hdr));
++	data = req + sizeof(req_hdr);
++	memcpy(data, eep + MT_EE_NIC_CONF_0,
++	       __MT_EE_MAX - MT_EE_NIC_CONF_0);
++
++	tx_power = hw->conf.power_level * 2;
++	switch (n_chains) {
++	case 4:
++		tx_power -= 12;
++		break;
++	case 3:
++		tx_power -= 8;
++		break;
++	case 2:
++		tx_power -= 6;
++		break;
++	default:
++		break;
++	}
++	tx_power = max_t(s8, tx_power, 0);
++	dev->mt76.txpower_cur = tx_power;
++
++	for (i = 0; i < n_chains; i++) {
++		int index = -MT_EE_NIC_CONF_0;
++
++		ret = mt7622_eeprom_get_power_index(dev, chandef->chan, i);
++		if (ret < 0)
++			goto out;
++
++		index += ret;
++		data[index] = min_t(u8, data[index], tx_power);
++	}
++
++	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_TX_POWER_CTRL,
++				  req, len, true);
++out:
++	kfree(req);
++
++	return ret;
++}
++
++int mt7622_mcu_set_channel(struct mt7622_dev *dev)
++{
++	struct cfg80211_chan_def *chandef = &dev->mt76.chandef;
++	int freq1 = chandef->center_freq1, freq2 = chandef->center_freq2;
++	struct {
++		u8 control_chan;
++		u8 center_chan;
++		u8 bw;
++		u8 tx_streams;
++		u8 rx_streams_mask;
++		u8 switch_reason;
++		u8 band_idx;
++		/* for 80+80 only */
++		u8 center_chan2;
++		__le16 cac_case;
++		u8 channel_band;
++		u8 rsv0;
++		__le32 outband_freq;
++		u8 txpower_drop;
++		u8 rsv1[3];
++		u8 txpower_sku[53];
++		u8 rsv2[3];
++	} req = {
++		.control_chan = chandef->chan->hw_value,
++		.center_chan = ieee80211_frequency_to_channel(freq1),
++		.tx_streams = (dev->mt76.chainmask >> 8) & 0xf,
++		.rx_streams_mask = dev->mt76.antenna_mask,
++		.center_chan2 = ieee80211_frequency_to_channel(freq2),
++	};
++	int ret;
++
++	if ((chandef->chan->flags & IEEE80211_CHAN_RADAR) &&
++	    chandef->chan->dfs_state != NL80211_DFS_AVAILABLE)
++		req.switch_reason = CH_SWITCH_DFS;
++	else
++		req.switch_reason = CH_SWITCH_NORMAL;
++
++	switch (dev->mt76.chandef.width) {
++	case NL80211_CHAN_WIDTH_40:
++		req.bw = CMD_CBW_40MHZ;
++		break;
++	case NL80211_CHAN_WIDTH_80:
++		req.bw = CMD_CBW_80MHZ;
++		break;
++	case NL80211_CHAN_WIDTH_80P80:
++		req.bw = CMD_CBW_8080MHZ;
++		break;
++	case NL80211_CHAN_WIDTH_160:
++		req.bw = CMD_CBW_160MHZ;
++		break;
++	case NL80211_CHAN_WIDTH_5:
++		req.bw = CMD_CBW_5MHZ;
++		break;
++	case NL80211_CHAN_WIDTH_10:
++		req.bw = CMD_CBW_10MHZ;
++		break;
++	case NL80211_CHAN_WIDTH_20_NOHT:
++	case NL80211_CHAN_WIDTH_20:
++	default:
++		req.bw = CMD_CBW_20MHZ;
++		break;
++	}
++	memset(req.txpower_sku, 0x3f, 49);
++
++	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_CHANNEL_SWITCH,
++				  &req, sizeof(req), true);
++	if (ret)
++		return ret;
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RX_PATH,
++				   &req, sizeof(req), true);
++}
++
++int mt7622_mcu_set_ht_cap(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++			  struct ieee80211_sta *sta)
++{
++	struct mt7622_sta *msta = (struct mt7622_sta *)sta->drv_priv;
++	struct mt7622_vif *mvif = (struct mt7622_vif *)vif->drv_priv;
++	struct wtbl_req_hdr *wtbl_hdr;
++	struct sta_req_hdr *sta_hdr;
++	struct wtbl_raw *wtbl_raw;
++	struct sta_rec_ht *sta_ht;
++	struct wtbl_ht *wtbl_ht;
++	int buf_len, ret, ntlv = 2;
++	u32 msk, val = 0;
++	u8 *buf;
++
++	buf = kzalloc(MT7622_WTBL_UPDATE_MAX_SIZE, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	wtbl_hdr = (struct wtbl_req_hdr *)buf;
++	wtbl_hdr->wlan_idx = msta->wcid.idx;
++	wtbl_hdr->operation = WTBL_SET;
++	buf_len = sizeof(*wtbl_hdr);
++
++	/* ht basic */
++	wtbl_ht = (struct wtbl_ht *)(buf + buf_len);
++	wtbl_ht->tag = cpu_to_le16(WTBL_HT);
++	wtbl_ht->len = cpu_to_le16(sizeof(*wtbl_ht));
++	wtbl_ht->ht = 1;
++	wtbl_ht->ldpc = sta->ht_cap.cap & IEEE80211_HT_CAP_LDPC_CODING;
++	wtbl_ht->af = sta->ht_cap.ampdu_factor;
++	wtbl_ht->mm = sta->ht_cap.ampdu_density;
++	buf_len += sizeof(*wtbl_ht);
++
++	if (sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_20)
++		val |= MT_WTBL_W5_SHORT_GI_20;
++	if (sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_40)
++		val |= MT_WTBL_W5_SHORT_GI_40;
++
++	/* vht basic */
++	if (sta->vht_cap.vht_supported) {
++		struct wtbl_vht *wtbl_vht;
++
++		wtbl_vht = (struct wtbl_vht *)(buf + buf_len);
++		buf_len += sizeof(*wtbl_vht);
++		wtbl_vht->tag = cpu_to_le16(WTBL_VHT);
++		wtbl_vht->len = cpu_to_le16(sizeof(*wtbl_vht));
++		wtbl_vht->ldpc = sta->vht_cap.cap & IEEE80211_VHT_CAP_RXLDPC;
++		wtbl_vht->vht = 1;
++		ntlv++;
++
++		if (sta->vht_cap.cap & IEEE80211_VHT_CAP_SHORT_GI_80)
++			val |= MT_WTBL_W5_SHORT_GI_80;
++		if (sta->vht_cap.cap & IEEE80211_VHT_CAP_SHORT_GI_160)
++			val |= MT_WTBL_W5_SHORT_GI_160;
++	}
++
++	/* smps */
++	if (sta->smps_mode == IEEE80211_SMPS_DYNAMIC) {
++		struct wtbl_smps *wtbl_smps;
++
++		wtbl_smps = (struct wtbl_smps *)(buf + buf_len);
++		buf_len += sizeof(*wtbl_smps);
++		wtbl_smps->tag = cpu_to_le16(WTBL_SMPS);
++		wtbl_smps->len = cpu_to_le16(sizeof(*wtbl_smps));
++		wtbl_smps->smps = 1;
++		ntlv++;
++	}
++
++	/* sgi */
++	msk = MT_WTBL_W5_SHORT_GI_20 | MT_WTBL_W5_SHORT_GI_40 |
++	      MT_WTBL_W5_SHORT_GI_80 | MT_WTBL_W5_SHORT_GI_160;
++
++	wtbl_raw = (struct wtbl_raw *)(buf + buf_len);
++	buf_len += sizeof(*wtbl_raw);
++	wtbl_raw->tag = cpu_to_le16(WTBL_RAW_DATA);
++	wtbl_raw->len = cpu_to_le16(sizeof(*wtbl_raw));
++	wtbl_raw->wtbl_idx = 1;
++	wtbl_raw->dw = 5;
++	wtbl_raw->msk = cpu_to_le32(~msk);
++	wtbl_raw->val = cpu_to_le32(val);
++
++	wtbl_hdr->tlv_num = cpu_to_le16(ntlv);
++	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_WTBL_UPDATE,
++				  buf, buf_len, true);
++	if (ret)
++		goto out;
++
++	memset(buf, 0, MT7622_WTBL_UPDATE_MAX_SIZE);
++
++	sta_hdr = (struct sta_req_hdr *)buf;
++	sta_hdr->bss_idx = mvif->idx;
++	sta_hdr->wlan_idx = msta->wcid.idx;
++	sta_hdr->is_tlv_append = 1;
++	ntlv = sta->vht_cap.vht_supported ? 2 : 1;
++	sta_hdr->tlv_num = cpu_to_le16(ntlv);
++	sta_hdr->muar_idx = mvif->omac_idx;
++	buf_len = sizeof(*sta_hdr);
++
++	sta_ht = (struct sta_rec_ht *)(buf + buf_len);
++	sta_ht->tag = cpu_to_le16(STA_REC_HT);
++	sta_ht->len = cpu_to_le16(sizeof(*sta_ht));
++	sta_ht->ht_cap = cpu_to_le16(sta->ht_cap.cap);
++	buf_len += sizeof(*sta_ht);
++
++	if (sta->vht_cap.vht_supported) {
++		struct sta_rec_vht *sta_vht;
++
++		sta_vht = (struct sta_rec_vht *)(buf + buf_len);
++		buf_len += sizeof(*sta_vht);
++		sta_vht->tag = cpu_to_le16(STA_REC_VHT);
++		sta_vht->len = cpu_to_le16(sizeof(*sta_vht));
++		sta_vht->vht_cap = cpu_to_le32(sta->vht_cap.cap);
++		sta_vht->vht_rx_mcs_map = sta->vht_cap.vht_mcs.rx_mcs_map;
++		sta_vht->vht_tx_mcs_map = sta->vht_cap.vht_mcs.tx_mcs_map;
++	}
++
++	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_STA_REC_UPDATE,
++				  buf, buf_len, true);
++out:
++	kfree(buf);
++
++	return ret;
++}
++
++int mt7622_mcu_set_tx_ba(struct mt7622_dev *dev,
++			 struct ieee80211_ampdu_params *params,
++			 bool add)
++{
++	struct mt7622_sta *msta = (struct mt7622_sta *)params->sta->drv_priv;
++	struct mt7622_vif *mvif = msta->vif;
++	struct {
++		struct wtbl_req_hdr hdr;
++		struct wtbl_ba ba;
++	} wtbl_req = {
++		.hdr = {
++			.wlan_idx = msta->wcid.idx,
++			.operation = WTBL_SET,
++			.tlv_num = cpu_to_le16(1),
++		},
++		.ba = {
++			.tag = cpu_to_le16(WTBL_BA),
++			.len = cpu_to_le16(sizeof(struct wtbl_ba)),
++			.tid = params->tid,
++			.ba_type = MT_BA_TYPE_ORIGINATOR,
++			.sn = add ? cpu_to_le16(params->ssn) : 0,
++			.ba_en = add,
++		},
++	};
++	struct {
++		struct sta_req_hdr hdr;
++		struct sta_rec_ba ba;
++	} sta_req = {
++		.hdr = {
++			.bss_idx = mvif->idx,
++			.wlan_idx = msta->wcid.idx,
++			.tlv_num = cpu_to_le16(1),
++			.is_tlv_append = 1,
++			.muar_idx = mvif->omac_idx,
++		},
++		.ba = {
++			.tag = cpu_to_le16(STA_REC_BA),
++			.len = cpu_to_le16(sizeof(struct sta_rec_ba)),
++			.tid = params->tid,
++			.ba_type = MT_BA_TYPE_ORIGINATOR,
++			.amsdu = params->amsdu,
++			.ba_en = add << params->tid,
++			.ssn = cpu_to_le16(params->ssn),
++			.winsize = cpu_to_le16(params->buf_size),
++		},
++	};
++	int ret;
++
++	if (add) {
++		u8 idx, ba_range[] = { 4, 8, 12, 24, 36, 48, 54, 64 };
++
++		for (idx = 7; idx > 0; idx--) {
++			if (params->buf_size >= ba_range[idx])
++				break;
++		}
++
++		wtbl_req.ba.ba_winsize_idx = idx;
++	}
++
++	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_WTBL_UPDATE,
++				  &wtbl_req, sizeof(wtbl_req), true);
++	if (ret)
++		return ret;
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_STA_REC_UPDATE,
++				   &sta_req, sizeof(sta_req), true);
++}
++
++int mt7622_mcu_set_rx_ba(struct mt7622_dev *dev,
++			 struct ieee80211_ampdu_params *params,
++			 bool add)
++{
++	struct mt7622_sta *msta = (struct mt7622_sta *)params->sta->drv_priv;
++	struct mt7622_vif *mvif = msta->vif;
++	struct {
++		struct wtbl_req_hdr hdr;
++		struct wtbl_ba ba;
++	} wtbl_req = {
++		.hdr = {
++			.wlan_idx = msta->wcid.idx,
++			.operation = WTBL_SET,
++			.tlv_num = cpu_to_le16(1),
++		},
++		.ba = {
++			.tag = cpu_to_le16(WTBL_BA),
++			.len = cpu_to_le16(sizeof(struct wtbl_ba)),
++			.tid = params->tid,
++			.ba_type = MT_BA_TYPE_RECIPIENT,
++			.rst_ba_tid = params->tid,
++			.rst_ba_sel = RST_BA_MAC_TID_MATCH,
++			.rst_ba_sb = 1,
++		},
++	};
++	struct {
++		struct sta_req_hdr hdr;
++		struct sta_rec_ba ba;
++	} sta_req = {
++		.hdr = {
++			.bss_idx = mvif->idx,
++			.wlan_idx = msta->wcid.idx,
++			.tlv_num = cpu_to_le16(1),
++			.is_tlv_append = 1,
++			.muar_idx = mvif->omac_idx,
++		},
++		.ba = {
++			.tag = cpu_to_le16(STA_REC_BA),
++			.len = cpu_to_le16(sizeof(struct sta_rec_ba)),
++			.tid = params->tid,
++			.ba_type = MT_BA_TYPE_RECIPIENT,
++			.amsdu = params->amsdu,
++			.ba_en = add << params->tid,
++			.ssn = cpu_to_le16(params->ssn),
++			.winsize = cpu_to_le16(params->buf_size),
++		},
++	};
++	int ret;
++
++	memcpy(wtbl_req.ba.peer_addr, params->sta->addr, ETH_ALEN);
++
++	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_STA_REC_UPDATE,
++				  &sta_req, sizeof(sta_req), true);
++	if (ret || !add)
++		return ret;
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_WTBL_UPDATE,
++				   &wtbl_req, sizeof(wtbl_req), true);
++}
++
++int mt7622_mcu_get_temperature(struct mt7622_dev *dev, int index)
++{
++	struct {
++		u8 action;
++		u8 rsv[3];
++	} req = {
++		.action = index,
++	};
++
++	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_GET_TEMP, &req,
++				   sizeof(req), true);
++}
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/mcu.h b/drivers/net/wireless/mediatek/mt76_new/mt7622/mcu.h
+new file mode 100644
+index 00000000..bda0fc0
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/mcu.h
+@@ -0,0 +1,565 @@
++/* SPDX-License-Identifier: ISC */
++/* Copyright (C) 2019 MediaTek Inc. */
++
++#ifndef __MT7622_MCU_H
++#define __MT7622_MCU_H
++
++struct mt7622_mcu_txd {
++	__le32 txd[8];
++
++	__le16 len;
++	__le16 pq_id;
++
++	u8 cid;
++	u8 pkt_type;
++	u8 set_query; /* FW don't care */
++	u8 seq;
++
++	u8 uc_d2b0_rev;
++	u8 ext_cid;
++	u8 s2d_index;
++	u8 ext_cid_ack;
++
++	u32 reserved[5];
++} __packed __aligned(4);
++
++/* event table */
++enum {
++	MCU_EVENT_TARGET_ADDRESS_LEN = 0x01,
++	MCU_EVENT_FW_START = 0x01,
++	MCU_EVENT_GENERIC = 0x01,
++	MCU_EVENT_ACCESS_REG = 0x02,
++	MCU_EVENT_MT_PATCH_SEM = 0x04,
++	MCU_EVENT_CH_PRIVILEGE = 0x18,
++	MCU_EVENT_EXT = 0xed,
++	MCU_EVENT_RESTART_DL = 0xef,
++};
++
++/* ext event table */
++enum {
++	MCU_EXT_EVENT_PS_SYNC = 0x5,
++	MCU_EXT_EVENT_FW_LOG_2_HOST = 0x13,
++	MCU_EXT_EVENT_THERMAL_PROTECT = 0x22,
++	MCU_EXT_EVENT_ASSERT_DUMP = 0x23,
++	MCU_EXT_EVENT_RDD_REPORT = 0x3a,
++	MCU_EXT_EVENT_CSA_NOTIFY = 0x4f,
++};
++
++struct mt7622_mcu_rxd {
++	__le32 rxd[4];
++
++	__le16 len;
++	__le16 pkt_type_id;
++
++	u8 eid;
++	u8 seq;
++	__le16 __rsv;
++
++	u8 ext_eid;
++	u8 __rsv1[2];
++	u8 s2d_index;
++};
++
++#define MCU_PQ_ID(p, q)		(((p) << 15) | ((q) << 10))
++#define MCU_PKT_ID		0xa0
++
++enum {
++	MCU_Q_QUERY,
++	MCU_Q_SET,
++	MCU_Q_RESERVED,
++	MCU_Q_NA
++};
++
++enum {
++	MCU_S2D_H2N,
++	MCU_S2D_C2N,
++	MCU_S2D_H2C,
++	MCU_S2D_H2CN
++};
++
++enum {
++	MCU_CMD_TARGET_ADDRESS_LEN_REQ = 0x01,
++	MCU_CMD_FW_START_REQ = 0x02,
++	MCU_CMD_INIT_ACCESS_REG = 0x3,
++	MCU_CMD_PATCH_START_REQ = 0x05,
++	MCU_CMD_PATCH_FINISH_REQ = 0x07,
++	MCU_CMD_PATCH_SEM_CONTROL = 0x10,
++	MCU_CMD_EXT_CID = 0xED,
++	MCU_CMD_FW_SCATTER = 0xEE,
++	MCU_CMD_RESTART_DL_REQ = 0xEF,
++};
++
++enum {
++	MCU_EXT_CMD_PM_STATE_CTRL = 0x07,
++	MCU_EXT_CMD_CHANNEL_SWITCH = 0x08,
++	MCU_EXT_CMD_SET_TX_POWER_CTRL = 0x11,
++	MCU_EXT_CMD_EFUSE_BUFFER_MODE = 0x21,
++	MCU_EXT_CMD_STA_REC_UPDATE = 0x25,
++	MCU_EXT_CMD_BSS_INFO_UPDATE = 0x26,
++	MCU_EXT_CMD_EDCA_UPDATE = 0x27,
++	MCU_EXT_CMD_DEV_INFO_UPDATE = 0x2A,
++	MCU_EXT_CMD_GET_TEMP = 0x2c,
++	MCU_EXT_CMD_WTBL_UPDATE = 0x32,
++	MCU_EXT_CMD_SET_RDD_CTRL = 0x3a,
++	MCU_EXT_CMD_PROTECT_CTRL = 0x3e,
++	MCU_EXT_CMD_DBDC_CTRL = 0x45,
++	MCU_EXT_CMD_MAC_INIT_CTRL = 0x46,
++	MCU_EXT_CMD_BCN_OFFLOAD = 0x49,
++	MCU_EXT_CMD_SET_RX_PATH = 0x4e,
++	MCU_EXT_CMD_SET_RDD_PATTERN = 0x7d,
++};
++
++enum {
++	PATCH_SEM_RELEASE = 0x0,
++	PATCH_SEM_GET	  = 0x1
++};
++
++enum {
++	PATCH_NOT_DL_SEM_FAIL	 = 0x0,
++	PATCH_IS_DL		 = 0x1,
++	PATCH_NOT_DL_SEM_SUCCESS = 0x2,
++	PATCH_REL_SEM_SUCCESS	 = 0x3
++};
++
++enum {
++	FW_STATE_INITIAL          = 0,
++	FW_STATE_FW_DOWNLOAD      = 1,
++	FW_STATE_NORMAL_OPERATION = 2,
++	FW_STATE_NORMAL_TRX       = 3,
++	FW_STATE_CR4_RDY          = 7
++};
++
++#define STA_TYPE_STA		BIT(0)
++#define STA_TYPE_AP		BIT(1)
++#define STA_TYPE_ADHOC		BIT(2)
++#define STA_TYPE_WDS		BIT(4)
++#define STA_TYPE_BC		BIT(5)
++
++#define NETWORK_INFRA		BIT(16)
++#define NETWORK_P2P		BIT(17)
++#define NETWORK_IBSS		BIT(18)
++#define NETWORK_WDS		BIT(21)
++
++#define CONNECTION_INFRA_STA	(STA_TYPE_STA | NETWORK_INFRA)
++#define CONNECTION_INFRA_AP	(STA_TYPE_AP | NETWORK_INFRA)
++#define CONNECTION_P2P_GC	(STA_TYPE_STA | NETWORK_P2P)
++#define CONNECTION_P2P_GO	(STA_TYPE_AP | NETWORK_P2P)
++#define CONNECTION_IBSS_ADHOC	(STA_TYPE_ADHOC | NETWORK_IBSS)
++#define CONNECTION_WDS		(STA_TYPE_WDS | NETWORK_WDS)
++#define CONNECTION_INFRA_BC	(STA_TYPE_BC | NETWORK_INFRA)
++
++#define CONN_STATE_DISCONNECT	0
++#define CONN_STATE_CONNECT	1
++#define CONN_STATE_PORT_SECURE	2
++
++enum {
++	DEV_INFO_ACTIVE,
++	DEV_INFO_MAX_NUM
++};
++
++struct bss_info_omac {
++	__le16 tag;
++	__le16 len;
++	u8 hw_bss_idx;
++	u8 omac_idx;
++	u8 band_idx;
++	u8 rsv0;
++	__le32 conn_type;
++	u32 rsv1;
++} __packed;
++
++struct bss_info_basic {
++	__le16 tag;
++	__le16 len;
++	__le32 network_type;
++	u8 active;
++	u8 rsv0;
++	__le16 bcn_interval;
++	u8 bssid[ETH_ALEN];
++	u8 wmm_idx;
++	u8 dtim_period;
++	u8 bmc_tx_wlan_idx;
++	u8 cipher; /* not used */
++	u8 phymode; /* not used */
++	u8 rsv1[5];
++} __packed;
++
++struct bss_info_rf_ch {
++	__le16 tag;
++	__le16 len;
++	u8 pri_ch;
++	u8 central_ch0;
++	u8 central_ch1;
++	u8 bw;
++} __packed;
++
++struct bss_info_ext_bss {
++	__le16 tag;
++	__le16 len;
++	__le32 mbss_tsf_offset; /* in unit of us */
++	u8 rsv[8];
++} __packed;
++
++enum {
++	BSS_INFO_OMAC,
++	BSS_INFO_BASIC,
++	BSS_INFO_RF_CH, /* optional, for BT/LTE coex */
++	BSS_INFO_PM, /* sta only */
++	BSS_INFO_UAPSD, /* sta only */
++	BSS_INFO_ROAM_DETECTION, /* obsoleted */
++	BSS_INFO_LQ_RM, /* obsoleted */
++	BSS_INFO_EXT_BSS,
++	BSS_INFO_BMC_INFO, /* for bmc rate control in CR4 */
++	BSS_INFO_SYNC_MODE, /* obsoleted */
++	BSS_INFO_RA,
++	BSS_INFO_MAX_NUM
++};
++
++enum {
++	WTBL_RESET_AND_SET = 1,
++	WTBL_SET,
++	WTBL_QUERY,
++	WTBL_RESET_ALL
++};
++
++struct wtbl_req_hdr {
++	u8 wlan_idx;
++	u8 operation;
++	__le16 tlv_num;
++	u8 rsv[4];
++} __packed;
++
++struct wtbl_generic {
++	__le16 tag;
++	__le16 len;
++	u8 peer_addr[ETH_ALEN];
++	u8 muar_idx;
++	u8 skip_tx;
++	u8 cf_ack;
++	u8 qos;
++	u8 mesh;
++	u8 adm;
++	__le16 partial_aid;
++	u8 baf_en;
++	u8 aad_om;
++} __packed;
++
++struct wtbl_rx {
++	__le16 tag;
++	__le16 len;
++	u8 rcid;
++	u8 rca1;
++	u8 rca2;
++	u8 rv;
++	u8 rsv[4];
++} __packed;
++
++struct wtbl_ht {
++	__le16 tag;
++	__le16 len;
++	u8 ht;
++	u8 ldpc;
++	u8 af;
++	u8 mm;
++} __packed;
++
++struct wtbl_vht {
++	__le16 tag;
++	__le16 len;
++	u8 ldpc;
++	u8 dyn_bw;
++	u8 vht;
++	u8 txop_ps;
++} __packed;
++
++struct wtbl_peer_ps {
++	__le16 tag;
++	__le16 len;
++	u8 du_ipsm;
++	u8 ipsm;
++	u8 rsv[2];
++} __packed;
++
++struct wtbl_tx_ps {
++	__le16 tag;
++	__le16 len;
++	u8 txps;
++	u8 rsv[3];
++} __packed;
++
++struct wtbl_hdr_trans {
++	__le16 tag;
++	__le16 len;
++	u8 to_ds;
++	u8 from_ds;
++	u8 disable_rx_trans;
++	u8 rsv;
++} __packed;
++
++enum {
++	MT_BA_TYPE_INVALID,
++	MT_BA_TYPE_ORIGINATOR,
++	MT_BA_TYPE_RECIPIENT
++};
++
++enum {
++	RST_BA_MAC_TID_MATCH,
++	RST_BA_MAC_MATCH,
++	RST_BA_NO_MATCH
++};
++
++struct wtbl_ba {
++	__le16 tag;
++	__le16 len;
++	/* common */
++	u8 tid;
++	u8 ba_type;
++	u8 rsv0[2];
++	/* originator only */
++	__le16 sn;
++	u8 ba_en;
++	u8 ba_winsize_idx;
++	__le16 ba_winsize;
++	/* recipient only */
++	u8 peer_addr[ETH_ALEN];
++	u8 rst_ba_tid;
++	u8 rst_ba_sel;
++	u8 rst_ba_sb;
++	u8 band_idx;
++	u8 rsv1[4];
++} __packed;
++
++struct wtbl_rdg {
++	__le16 tag;
++	__le16 len;
++	u8 rdg_ba;
++	u8 r;
++	u8 rsv[2];
++} __packed;
++
++struct wtbl_protection {
++	__le16 tag;
++	__le16 len;
++	u8 rts;
++	u8 rsv[3];
++} __packed;
++
++struct wtbl_clear {
++	__le16 tag;
++	__le16 len;
++	u8 clear;
++	u8 rsv[3];
++} __packed;
++
++struct wtbl_bf {
++	__le16 tag;
++	__le16 len;
++	u8 ibf;
++	u8 ebf;
++	u8 ibf_vht;
++	u8 ebf_vht;
++	u8 gid;
++	u8 pfmu_idx;
++	u8 rsv[2];
++} __packed;
++
++struct wtbl_smps {
++	__le16 tag;
++	__le16 len;
++	u8 smps;
++	u8 rsv[3];
++} __packed;
++
++struct wtbl_spe {
++	__le16 tag; /* tag = 0x10 */
++	__le16 len;
++	u8 spe_idx;
++	u8 rsv[3];
++} __packed;
++
++struct wtbl_raw {
++	__le16 tag; /* tag = 0x0e */
++	__le16 len;
++	u8 wtbl_idx;
++	u8 dw;
++	u8 rsv[2];
++	__le32 msk;
++	__le32 val;
++} __packed;
++
++#define MT7622_WTBL_UPDATE_MAX_SIZE (sizeof(struct wtbl_req_hdr) + \
++				     sizeof(struct wtbl_generic) + \
++				     sizeof(struct wtbl_rx) + \
++				     sizeof(struct wtbl_ht) + \
++				     sizeof(struct wtbl_vht) + \
++				     sizeof(struct wtbl_peer_ps) + \
++				     sizeof(struct wtbl_tx_ps) + \
++				     sizeof(struct wtbl_hdr_trans) + \
++				     sizeof(struct wtbl_ba) + \
++				     sizeof(struct wtbl_rdg) + \
++				     sizeof(struct wtbl_protection) + \
++				     sizeof(struct wtbl_clear) + \
++				     sizeof(struct wtbl_bf) + \
++				     sizeof(struct wtbl_smps) + \
++				     sizeof(struct wtbl_raw) + \
++				     sizeof(struct wtbl_spe))
++
++enum {
++	WTBL_GENERIC,
++	WTBL_RX,
++	WTBL_HT,
++	WTBL_VHT,
++	WTBL_PEER_PS, /* not used */
++	WTBL_TX_PS,
++	WTBL_HDR_TRANS,
++	WTBL_SEC_KEY,
++	WTBL_BA,
++	WTBL_RDG, /* obsoleted */
++	WTBL_PROTECT, /* not used */
++	WTBL_CLEAR, /* not used */
++	WTBL_BF,
++	WTBL_SMPS,
++	WTBL_RAW_DATA, /* debug only */
++	WTBL_PN,
++	WTBL_SPE,
++	WTBL_MAX_NUM
++};
++
++struct sta_req_hdr {
++	u8 bss_idx;
++	u8 wlan_idx;
++	__le16 tlv_num;
++	u8 is_tlv_append;
++	u8 muar_idx;
++	u8 rsv[2];
++} __packed;
++
++struct sta_rec_basic {
++	__le16 tag;
++	__le16 len;
++	__le32 conn_type;
++	u8 conn_state;
++	u8 qos;
++	__le16 aid;
++	u8 peer_addr[ETH_ALEN];
++#define EXTRA_INFO_VER	BIT(0)
++#define EXTRA_INFO_NEW	BIT(1)
++	__le16 extra_info;
++} __packed;
++
++struct sta_rec_ht {
++	__le16 tag;
++	__le16 len;
++	__le16 ht_cap;
++	u16 rsv;
++} __packed;
++
++struct sta_rec_vht {
++	__le16 tag;
++	__le16 len;
++	__le32 vht_cap;
++	__le16 vht_rx_mcs_map;
++	__le16 vht_tx_mcs_map;
++} __packed;
++
++struct sta_rec_ba {
++	__le16 tag;
++	__le16 len;
++	u8 tid;
++	u8 ba_type;
++	u8 amsdu;
++	u8 ba_en;
++	__le16 ssn;
++	__le16 winsize;
++} __packed;
++
++struct sta_rec_tx_proc {
++	__le16 tag;
++	__le16 len;
++	__le32 tx_proc_flag;
++} __packed;
++
++struct sta_rec_apps {
++	__le16	tag;		/* Tag = 11 */
++	__le16	len;
++	u8	bmp_delivery_ac;
++	u8	bmp_trigger_ac;
++	u8	max_sp_len;
++	u8	rsv[1];
++	__le16	sta_listen_interval;
++	u8	rsv2[2];
++} __packed;
++
++struct sta_rec_wtbl {
++	__le16 tag;
++	__le16 len;
++	u8 buf[MT7622_WTBL_UPDATE_MAX_SIZE];
++} __packed;
++
++struct sta_rec_hwamsdu {
++	__le16  tag;		/* Tag = 0x0f */
++	__le16  len;
++	u8   max_amsdu_num;
++	u8   max_mpsu_size;
++	u8   amsdu_en;
++	u8   rsv[1];
++} __packed;
++
++#define MT7622_STA_REC_UPDATE_MAX_SIZE (sizeof(struct sta_req_hdr) + \
++					sizeof(struct sta_rec_basic) + \
++					sizeof(struct sta_rec_ht) + \
++					sizeof(struct sta_rec_vht) + \
++					sizeof(struct sta_rec_ba) + \
++					sizeof(struct sta_rec_tx_proc) + \
++					sizeof(struct sta_rec_apps) + \
++					sizeof(struct sta_rec_wtbl) + \
++					sizeof(struct sta_rec_hwamsdu))
++
++enum {
++	STA_REC_BASIC,
++	STA_REC_RA,
++	STA_REC_RA_CMM_INFO,
++	STA_REC_RA_UPDATE,
++	STA_REC_BF,
++	STA_REC_AMSDU,
++	STA_REC_BA,
++	STA_REC_RED, /* not used */
++	STA_REC_TX_PROC, /* for hdr trans and CSO in CR4 */
++	STA_REC_HT,
++	STA_REC_VHT,
++	STA_REC_APPS,
++	STA_REC_INSTALL_KEY,
++	STA_REC_WTBL,
++	STA_REC_HWAMSDU = 0xf,
++	STA_REC_MAX_NUM
++};
++
++enum {
++	CMD_CBW_20MHZ,
++	CMD_CBW_40MHZ,
++	CMD_CBW_80MHZ,
++	CMD_CBW_160MHZ,
++	CMD_CBW_10MHZ,
++	CMD_CBW_5MHZ,
++	CMD_CBW_8080MHZ
++};
++
++enum {
++	CH_SWITCH_NORMAL = 0,
++	CH_SWITCH_SCAN = 3,
++	CH_SWITCH_MCC = 4,
++	CH_SWITCH_DFS = 5,
++	CH_SWITCH_BACKGROUND_SCAN_START = 6,
++	CH_SWITCH_BACKGROUND_SCAN_RUNNING = 7,
++	CH_SWITCH_BACKGROUND_SCAN_STOP = 8,
++	CH_SWITCH_SCAN_BYPASS_DPD = 9
++};
++
++static inline struct sk_buff *
++mt7622_mcu_msg_alloc(const void *data, int len)
++{
++	return mt76_mcu_msg_alloc(data, sizeof(struct mt7622_mcu_txd),
++				  len, 0);
++}
++
++#endif
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/mt7622.h b/drivers/net/wireless/mediatek/mt76_new/mt7622/mt7622.h
+new file mode 100644
+index 00000000..397b406
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/mt7622.h
+@@ -0,0 +1,239 @@
++/* SPDX-License-Identifier: ISC */
++/* Copyright (C) 2019 MediaTek Inc. */
++
++#ifndef __MT7622_H
++#define __MT7622_H
++
++#include <linux/interrupt.h>
++#include <linux/ktime.h>
++#include "../mt76.h"
++#include "regs.h"
++
++#define MT7622_MAX_INTERFACES		4
++#define MT7622_MAX_WMM_SETS		4
++#define MT7622_WTBL_SIZE		128
++#define MT7622_WTBL_RESERVED		(MT7622_WTBL_SIZE - 1)
++#define MT7622_WTBL_STA			(MT7622_WTBL_RESERVED - \
++					 MT7622_MAX_INTERFACES)
++
++#define MT7622_WATCHDOG_TIME		(HZ / 10)
++#define MT7622_RATE_RETRY		2
++
++#define MT7622_TX_RING_SIZE		512
++#define MT7622_TX_MCU_RING_SIZE		128
++#define MT7622_TX_FWDL_RING_SIZE	128
++
++#define MT7622_RX_RING_SIZE		512
++#define MT7622_RX_MCU_RING_SIZE		512
++
++#define MT7622_FIRMWARE_N9		"mediatek/mt7622_n9.bin"
++#define MT7622_ROM_PATCH		"mediatek/mt7622_rom_patch.bin"
++
++#define MT7622_EEPROM_SIZE		1024
++#define MT7622_TOKEN_SIZE		4096
++
++struct mt7622_vif;
++struct mt7622_sta;
++
++enum mt7622_hw_txq_id {
++	MT7622_TXQ_MAIN,
++	MT7622_TXQ_EXT,
++	MT7622_TXQ_FWDL = 3,
++	MT7622_TXQ_MGMT = 5,
++	MT7622_TXQ_MCU = 15,
++};
++
++struct mt7622_rate_set {
++	struct ieee80211_tx_rate probe_rate;
++	struct ieee80211_tx_rate rates[4];
++};
++
++struct mt7622_sta {
++	struct mt76_wcid wcid; /* must be first */
++
++	struct mt7622_vif *vif;
++
++	struct ieee80211_tx_rate rates[4];
++
++	struct mt7622_rate_set rateset[2];
++	u32 rate_set_tsf;
++
++	u8 rate_count;
++	u8 n_rates;
++
++	u8 rate_probe;
++};
++
++struct mt7622_vif {
++	u8 idx;
++	u8 omac_idx;
++	u8 band_idx;
++	u8 wmm_idx;
++
++	struct mt7622_sta sta;
++};
++
++struct mt7622_dev {
++	struct mt76_dev mt76; /* must be first */
++	u32 vif_mask;
++	u32 omac_mask;
++
++	__le32 rx_ampdu_ts;
++
++	int false_cca_ofdm, false_cca_cck;
++	unsigned long last_cca_adj;
++	u8 mac_work_count;
++	s8 ofdm_sensitivity;
++	s8 cck_sensitivity;
++	bool scs_en;
++
++	spinlock_t token_lock;
++	struct idr token;
++
++	const u32 *regs;
++};
++
++struct mt7622_rate_desc {
++	int wcid;
++	u8 bw;
++	u8 bw_idx;
++	u16 val[4];
++	u16 probe_val;
++	bool rateset;
++
++	struct mt7622_sta *sta;
++	struct list_head node;
++};
++
++enum {
++	HW_BSSID_0 = 0x0,
++	HW_BSSID_1,
++	HW_BSSID_2,
++	HW_BSSID_3,
++	HW_BSSID_MAX,
++	EXT_BSSID_START = 0x10,
++	EXT_BSSID_1,
++	EXT_BSSID_2,
++	EXT_BSSID_3,
++	EXT_BSSID_4,
++	EXT_BSSID_5,
++	EXT_BSSID_6,
++	EXT_BSSID_7,
++	EXT_BSSID_8,
++	EXT_BSSID_9,
++	EXT_BSSID_10,
++	EXT_BSSID_11,
++	EXT_BSSID_12,
++	EXT_BSSID_13,
++	EXT_BSSID_14,
++	EXT_BSSID_15,
++	EXT_BSSID_END
++};
++
++enum {
++	MT_RX_SEL0,
++	MT_RX_SEL1,
++};
++
++extern const struct ieee80211_ops mt7622_ops;
++
++int mt7622_register_device(struct mt7622_dev *dev);
++void mt7622_unregister_device(struct mt7622_dev *dev);
++int mt7622_eeprom_init(struct mt7622_dev *dev);
++int mt7622_eeprom_get_power_index(struct mt7622_dev *dev,
++				  struct ieee80211_channel *chan,
++				  u8 chain_idx);
++int mt7622_dma_sched_init(struct mt7622_dev *dev);
++int mt7622_dma_init(struct mt7622_dev *dev);
++void mt7622_dma_cleanup(struct mt7622_dev *dev);
++int mt7622_mcu_init(struct mt7622_dev *dev);
++int mt7622_mcu_set_dev_info(struct mt7622_dev *dev,
++			    struct ieee80211_vif *vif, bool enable);
++int mt7622_mcu_set_bss_info(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++			    int en);
++void mt7622_mac_set_scs(struct mt7622_dev *dev, bool enable);
++void mt7622_mac_set_rates(struct mt7622_dev *dev, struct mt7622_sta *sta,
++			  struct ieee80211_tx_rate *probe_rate,
++			  struct ieee80211_tx_rate *rates);
++int mt7622_mcu_wtbl_bmc(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++			bool enable);
++int mt7622_mcu_add_wtbl(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++			struct ieee80211_sta *sta);
++int mt7622_mcu_del_wtbl(struct mt7622_dev *dev, struct ieee80211_sta *sta);
++int mt7622_mcu_del_wtbl_all(struct mt7622_dev *dev);
++int mt7622_mcu_set_sta_rec_bmc(struct mt7622_dev *dev,
++			       struct ieee80211_vif *vif, bool en);
++int mt7622_mcu_set_sta_rec(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++			   struct ieee80211_sta *sta, bool en);
++int mt7622_mcu_set_bcn(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++		       int en);
++int mt7622_mcu_set_channel(struct mt7622_dev *dev);
++int mt7622_mcu_set_wmm(struct mt7622_dev *dev, u8 queue,
++		       const struct ieee80211_tx_queue_params *params);
++int mt7622_mcu_set_tx_ba(struct mt7622_dev *dev,
++			 struct ieee80211_ampdu_params *params,
++			 bool add);
++int mt7622_mcu_set_rx_ba(struct mt7622_dev *dev,
++			 struct ieee80211_ampdu_params *params,
++			 bool add);
++int mt7622_mcu_set_ht_cap(struct mt7622_dev *dev, struct ieee80211_vif *vif,
++			  struct ieee80211_sta *sta);
++void mt7622_mcu_rx_event(struct mt7622_dev *dev, struct sk_buff *skb);
++
++static inline void mt7622_irq_enable(struct mt7622_dev *dev, u32 mask)
++{
++	mt76_set_irq_mask(&dev->mt76, MT_INT_MASK_CSR(dev), 0, mask);
++}
++
++static inline void mt7622_irq_disable(struct mt7622_dev *dev, u32 mask)
++{
++	mt76_set_irq_mask(&dev->mt76, MT_INT_MASK_CSR(dev), mask, 0);
++}
++
++void mt7622_update_channel(struct mt76_dev *mdev);
++void mt7622_mac_cca_stats_reset(struct mt7622_dev *dev);
++
++int mt7622_mac_write_txwi(struct mt7622_dev *dev, __le32 *txwi,
++			  struct sk_buff *skb, enum mt76_txq_id qid,
++			  struct mt76_wcid *wcid,
++			  struct ieee80211_sta *sta, int pid,
++			  struct ieee80211_key_conf *key);
++int mt7622_mac_fill_rx(struct mt7622_dev *dev, struct sk_buff *skb);
++void mt7622_mac_add_txs(struct mt7622_dev *dev, void *data);
++void mt7622_mac_tx_free(struct mt7622_dev *dev, struct sk_buff *skb);
++int mt7622_mac_wtbl_set_key(struct mt7622_dev *dev, struct mt76_wcid *wcid,
++			    struct ieee80211_key_conf *key,
++			    enum set_key_cmd cmd);
++
++bool mt7622_mac_wtbl_update(struct mt7622_dev *dev, int idx, u32 mask);
++int mt7622_mcu_set_eeprom(struct mt7622_dev *dev);
++int mt7622_mcu_init_mac(struct mt7622_dev *dev);
++int mt7622_mcu_set_rts_thresh(struct mt7622_dev *dev, u32 val);
++int mt7622_mcu_ctrl_pm_state(struct mt7622_dev *dev, int enter);
++int mt7622_mcu_get_temperature(struct mt7622_dev *dev, int index);
++int mt7622_mcu_set_tx_power(struct mt7622_dev *dev);
++void mt7622_mcu_exit(struct mt7622_dev *dev);
++
++int mt7622_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
++			  enum mt76_txq_id qid, struct mt76_wcid *wcid,
++			  struct ieee80211_sta *sta,
++			  struct mt76_tx_info *tx_info);
++
++void mt7622_tx_complete_skb(struct mt76_dev *mdev, enum mt76_txq_id qid,
++			    struct mt76_queue_entry *e);
++
++void mt7622_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
++			 struct sk_buff *skb);
++void mt7622_sta_ps(struct mt76_dev *mdev, struct ieee80211_sta *sta, bool ps);
++int mt7622_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
++		   struct ieee80211_sta *sta);
++void mt7622_sta_assoc(struct mt76_dev *mdev, struct ieee80211_vif *vif,
++		      struct ieee80211_sta *sta);
++void mt7622_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
++		       struct ieee80211_sta *sta);
++void mt7622_mac_work(struct work_struct *work);
++void mt7622_txp_skb_unmap(struct mt76_dev *dev,
++			  struct mt76_txwi_cache *txwi);
++
++int mt7622_init_debugfs(struct mt7622_dev *dev);
++#endif
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/regs.h b/drivers/net/wireless/mediatek/mt76_new/mt7622/regs.h
+new file mode 100644
+index 00000000..b639588
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/regs.h
+@@ -0,0 +1,405 @@
++/* SPDX-License-Identifier: ISC */
++/* Copyright (C) 2019 MediaTek Inc. */
++
++#ifndef __MT7622_REGS_H
++#define __MT7622_REGS_H
++
++enum mt7622_regs_base {
++	MCU_BASE,
++	PDMA_BASE,
++	DMASHDL_BASE,
++	DMASHDL_REMAP_BASE,
++	DMASHDL_OFS_BASE,
++	CSR_BASE,
++	WF_PHY_BASE,
++	WF_CFG_BASE,
++	WF_AGG_BASE,
++	WF_TMAC_BASE,
++	WF_RMAC_BASE,
++	WF_DMA_BASE,
++	WTBL_ON_BASE,
++	WTBL_OFF_BASE,
++	LPON_BASE,
++	WF_MIB_BASE,
++	WTBL_BASE,
++	TOPCFG_BASE,
++	__MAX_BASE,
++};
++
++static const u32 mt7622_mmio_regs_base[] = {
++	[MCU_BASE] =			0x2000,
++	[PDMA_BASE] =			0x4000,
++	[DMASHDL_BASE] =		0x5000a000,
++	[DMASHDL_REMAP_BASE] =  0x2504,
++	[DMASHDL_OFS_BASE] =	0x80000,
++	[CSR_BASE] =			0x7000,
++	[WF_PHY_BASE] =			0x10000,
++	[WF_CFG_BASE] =			0x20200,
++	[WF_AGG_BASE] =			0x20a00,
++	[WF_TMAC_BASE] =		0x21000,
++	[WF_RMAC_BASE] =		0x21200,
++	[WF_DMA_BASE] =			0x21800,
++	[WTBL_ON_BASE] =		0x23000,
++	[WTBL_OFF_BASE] =		0x23400,
++	[LPON_BASE] =			0x24200,
++	[WF_MIB_BASE] =			0x24800,
++	[WTBL_BASE] =			0x30000,
++	[TOPCFG_BASE] =			0x00000,
++};
++
++#define MT_TOP_MISC2(dev)		((dev)->regs[TOPCFG_BASE] + 0x134)
++#define MT_TOP_MISC2_FW_STATE		GENMASK(3, 1)
++
++#define MT_TOP_CFG_BASE		0x0000
++#define MT_TOP_OFF_RSV		(MT_TOP_CFG_BASE + 0x1128)
++#define MT_TOP_OFF_RSV_FW_STATE		GENMASK(18, 16)
++
++#define MT_HW_REV(dev)			((dev)->regs[TOPCFG_BASE] + 0x1000)
++#define MT_HW_CHIPID(dev)		((dev)->regs[TOPCFG_BASE] + 0x1008)
++
++#define MT_HIF(dev, ofs)		((dev)->regs[PDMA_BASE] + (ofs))
++
++#define MT_CFG_LPCR_HOST(dev)		MT_HIF(dev, 0x1f0)
++#define MT_CFG_LPCR_HOST_FW_OWN		BIT(0)
++#define MT_CFG_LPCR_HOST_DRV_OWN	BIT(1)
++
++#define MT_CONN_HIF_ON_LPCTL(dev)	((dev)->regs[CSR_BASE] + 0x0000)
++
++#define MT_INT_SOURCE_CSR(dev)		MT_HIF(dev, 0x200)
++#define MT_INT_MASK_CSR(dev)		MT_HIF(dev, 0x204)
++#define MT_DELAY_INT_CFG(dev)		MT_HIF(dev, 0x210)
++
++#define MT_INT_RX_DONE(_n)		BIT(_n)
++#define MT_INT_RX_DONE_ALL		GENMASK(1, 0)
++#define MT_INT_TX_DONE_ALL		GENMASK(19, 4)
++#define MT_INT_TX_DONE(_n)		BIT((_n) + 4)
++
++#define MT_WPDMA_GLO_CFG(dev)			MT_HIF(dev, 0x208)
++#define MT_WPDMA_GLO_CFG_TX_DMA_EN		BIT(0)
++#define MT_WPDMA_GLO_CFG_TX_DMA_BUSY		BIT(1)
++#define MT_WPDMA_GLO_CFG_RX_DMA_EN		BIT(2)
++#define MT_WPDMA_GLO_CFG_RX_DMA_BUSY		BIT(3)
++#define MT_WPDMA_GLO_CFG_DMA_BURST_SIZE		GENMASK(5, 4)
++#define MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE	BIT(6)
++#define MT_WPDMA_GLO_CFG_BIG_ENDIAN		BIT(7)
++#define MT_WPDMA_GLO_CFG_FW_RING_BP_TX_SCH	BIT(9)
++#define MT_WPDMA_GLO_CFG_MULTI_DMA_EN		GENMASK(11, 10)
++#define MT_WPDMA_GLO_CFG_FIFO_LITTLE_ENDIAN	BIT(12)
++#define MT_WPDMA_GLO_CFG_TX_BT_SIZE_BIT21	GENMASK(23, 22)
++#define MT_WPDMA_GLO_CFG_SW_RESET		BIT(24)
++#define MT_WPDMA_GLO_CFG_FIRST_TOKEN_ONLY	BIT(26)
++#define MT_WPDMA_GLO_CFG_OMIT_TX_INFO		BIT(28)
++
++#define MT_WPDMA_RST_IDX(dev)		MT_HIF(dev, 0x20c)
++
++#define MT_TX_RING_BASE(dev)		MT_HIF(dev, 0x300)
++#define MT_RX_RING_BASE(dev)		MT_HIF(dev, 0x400)
++
++#define MT_WPDMA_GLO_CFG1(dev)		MT_HIF(dev, 0x500)
++#define MT_WPDMA_TX_PRE_CFG(dev)	MT_HIF(dev, 0x510)
++#define MT_WPDMA_RX_PRE_CFG(dev)	MT_HIF(dev, 0x520)
++#define MT_WPDMA_ABT_CFG(dev)		MT_HIF(dev, 0x530)
++#define MT_WPDMA_ABT_CFG1(dev)		MT_HIF(dev, 0x534)
++
++#define MT_WF_PHY(dev, ofs)		((dev)->regs[WF_PHY_BASE] + (ofs))
++
++#define MT_WF_PHY_WF2_RFCTRL0(dev)	MT_WF_PHY(dev, 0x1900)
++#define MT_WF_PHY_WF2_RFCTRL0_LPBCN_EN	BIT(9)
++
++#define MT_WF_PHY_R0_B0_PHYMUX_5(dev)	MT_WF_PHY(dev, 0x0614)
++
++#define MT_WF_PHY_R0_B0_PHYCTRL_STS0(dev)	MT_WF_PHY(dev, 0x020c)
++#define MT_WF_PHYCTRL_STAT_PD_OFDM			GENMASK(31, 16)
++#define MT_WF_PHYCTRL_STAT_PD_CCK			GENMASK(15, 0)
++
++#define MT_WF_PHY_R0_B0_PHYCTRL_STS5(dev)	MT_WF_PHY(dev, 0x0220)
++#define MT_WF_PHYCTRL_STAT_MDRDY_OFDM		GENMASK(31, 16)
++#define MT_WF_PHYCTRL_STAT_MDRDY_CCK		GENMASK(15, 0)
++
++#define MT_WF_PHY_B0_MIN_PRI_PWR(dev)		MT_WF_PHY(dev, 0x229c)
++#define MT_WF_PHY_B0_PD_OFDM_MASK			GENMASK(28, 20)
++#define MT_WF_PHY_B0_PD_BLK					BIT(19)
++
++#define MT_WF_PHY_RXTD_CCK_PD7(dev)	MT_WF_PHY(dev, 0x2310)
++#define MT_WF_PHY_PD7_CCK_MASK		GENMASK(8, 1)
++
++#define MT_WF_PHY_RXTD_CCK_PD8(dev)	MT_WF_PHY(dev, 0x2314)
++#define MT_WF_PHY_PD8_CCK_MASK		GENMASK(31, 24)
++
++#define PLE_PKT_MAX_SIZE_MASK		(0xfff << 0)
++#define PLE_PKT_MAX_SIZE_NUM(p)		(((p) & 0xfff) << 0)
++#define GET_PLE_PKT_MAX_SIZE_NUM(p)	(((p) & PLE_PKT_MAX_SIZE_MASK) >> 0)
++
++#define PSE_PKT_MAX_SIZE_MASK		(0xfff << 16)
++#define PSE_PKT_MAX_SIZE_NUM(p)		(((p) & 0xfff) << 16)
++#define GET_PSE_PKT_MAX_SIZE_NUM(p)	(((p) & PSE_PKT_MAX_SIZE_MASK) >> 16)
++
++#define MT_DMASHDL(dev, ofs)	((dev)->regs[DMASHDL_BASE] + (ofs))
++#define MT_DMASHDL_REMAP(dev)	((dev)->regs[DMASHDL_REMAP_BASE])
++#define MT_DMASHDL_OFS(dev, ofs)	((dev)->regs[DMASHDL_OFS_BASE] + (ofs & 0xffff))
++#define MT_HIF_DMASHDL_OPTION_CTRL(dev)	(MT_DMASHDL(dev, 0x08))
++#define MT_HIF_DMASHDL_REFILL_CTRL(dev)	(MT_DMASHDL(dev, 0x10))
++#define MT_HIF_DMASHDL_GROUP0_CTRL(dev)	(MT_DMASHDL(dev, 0x20))
++#define MT_HIF_DMASHDL_GROUP1_CTRL(dev)	(MT_DMASHDL(dev, 0x24))
++#define MT_HIF_DMASHDL_GROUP2_CTRL(dev)	(MT_DMASHDL(dev, 0x28))
++#define MT_HIF_DMASHDL_GROUP3_CTRL(dev)	(MT_DMASHDL(dev, 0x2c))
++#define MT_HIF_DMASHDL_GROUP4_CTRL(dev)	(MT_DMASHDL(dev, 0x30))
++#define MT_HIF_DMASHDL_GROUP5_CTRL(dev)	(MT_DMASHDL(dev, 0x34))
++#define MT_HIF_DMASHDL_GROUP6_CTRL(dev)	(MT_DMASHDL(dev, 0x38))
++#define MT_HIF_DMASHDL_GROUP7_CTRL(dev)	(MT_DMASHDL(dev, 0x3c))
++#define MT_HIF_DMASHDL_GROUP8_CTRL(dev)	(MT_DMASHDL(dev, 0x40))
++#define MT_HIF_DMASHDL_GROUP9_CTRL(dev)	(MT_DMASHDL(dev, 0x44))
++#define MT_HIF_DMASHDL_GROUP10_CTRL(dev)	(MT_DMASHDL(dev, 0x48))
++#define MT_HIF_DMASHDL_GROUP11_CTRL(dev)	(MT_DMASHDL(dev, 0x4c))
++#define MT_HIF_DMASHDL_GROUP12_CTRL(dev)	(MT_DMASHDL(dev, 0x50))
++#define MT_HIF_DMASHDL_GROUP13_CTRL(dev)	(MT_DMASHDL(dev, 0x54))
++#define MT_HIF_DMASHDL_GROUP14_CTRL(dev)	(MT_DMASHDL(dev, 0x58))
++#define MT_HIF_DMASHDL_GROUP15_CTRL(dev)	(MT_DMASHDL(dev, 0x5c))
++
++#define MT_HIF_DMASHDL_SHDL_SET0(dev)	(MT_DMASHDL(dev, 0xb0))
++#define MT_HIF_DMASHDL_SHDL_SET1(dev)	(MT_DMASHDL(dev, 0xb4))
++
++#define MT_HIF_DMASHDL_Q_MAP0(dev)	(MT_DMASHDL(dev, 0xd0))
++#define MT_HIF_DMASHDL_Q_MAP1(dev)	(MT_DMASHDL(dev, 0xd4))
++#define MT_HIF_DMASHDL_Q_MAP2(dev)	(MT_DMASHDL(dev, 0xd8))
++#define MT_HIF_DMASHDL_Q_MAP3(dev)	(MT_DMASHDL(dev, 0xdc))
++#define MT_HIF_DMASHDL_PKT_MAX_SIZE(dev) ((dev)->regs[DMASHDL_BASE] + 0x1c)
++
++#define DMASHDL_MAX_QUOTA_MASK         (0xfff << 16)
++#define DMASHDL_MIN_QUOTA_MASK         (0xfff << 0)
++#define DMASHDL_MAX_QUOTA_OFFSET       16
++#define DMASHDL_MIN_QUOTA_OFFSET       0
++
++#define DMASHDL_MIN_QUOTA_NUM(p) (((p) & 0xfff) << DMASHDL_MIN_QUOTA_OFFSET)
++#define GET_DMASHDL_MIN_QUOTA_NUM(p) \
++	(((p) & DMASHDL_MIN_QUOTA_MASK) >> DMASHDL_MIN_QUOTA_OFFSET)
++
++#define DMASHDL_MAX_QUOTA_NUM(p) (((p) & 0xfff) << DMASHDL_MAX_QUOTA_OFFSET)
++#define GET_DMASHDL_MAX_QUOTA_NUM(p) \
++	(((p) & DMASHDL_MAX_QUOTA_MASK) >> DMASHDL_MAX_QUOTA_OFFSET)
++
++#define DMASHDL_OPTIONAL_CONTROL(dev)	MT_DMASHDL(dev, 0x8)
++#define DMASHDL_PAGE_SETTING(dev)	MT_DMASHDL(dev, 0xc)
++#define GROUP_SEQUENCE_ORDER_TYPE	BIT(16)
++
++#define DMASHDL_REFILL_CONTROL(dev)	MT_DMASHDL(dev, 0x10)
++
++#define DMASHDL_PKT_MAX_SIZE(dev)	MT_DMASHDL(dev, 0x1c)
++#define PLE_PACKET_MAX_SIZE		GENMASK(11, 0)
++#define PSE_PACKET_MAX_SIZE		GENMASK(27, 16)
++
++#define DMASHDL_GROUP0_CONTROL(dev)	MT_DMASHDL(dev, 0x20)
++#define DMASHDL_GROUP1_CONTROL(dev)	MT_DMASHDL(dev, 0x24)
++#define DMASHDL_GROUP2_CONTROL(dev)	MT_DMASHDL(dev, 0x28)
++#define DMASHDL_GROUP3_CONTROL(dev)	MT_DMASHDL(dev, 0x2c)
++#define DMASHDL_GROUP4_CONTROL(dev)	MT_DMASHDL(dev, 0x30)
++#define DMASHDL_GROUP15_CONTROL(dev)	MT_DMASHDL(dev, 0x5c)
++#define MIN_QUOTA			GENMASK(11, 0)
++#define MAX_QUOTA			GENMASK(27, 16)
++
++#define DMASHDL_SCHED_SETTING0(dev)	MT_DMASHDL(dev, 0xb0)
++#define DMASHDL_SCHED_SETTING1(dev)	MT_DMASHDL(dev, 0xb4)
++
++#define DMASHDL_QUEUE_MAPPING0(dev)	MT_DMASHDL(dev, 0xd0)
++#define DMASHDL_QUEUE_MAPPING1(dev)	MT_DMASHDL(dev, 0xd4)
++#define DMASHDL_QUEUE_MAPPING2(dev)	MT_DMASHDL(dev, 0xd8)
++#define DMASHDL_QUEUE_MAPPING3(dev)	MT_DMASHDL(dev, 0xdc)
++#define QUEUE0_MAP			GENMASK(3, 0)
++#define QUEUE1_MAP			GENMASK(7, 4)
++#define QUEUE2_MAP			GENMASK(11, 8)
++#define QUEUE3_MAP			GENMASK(15, 12)
++#define QUEUE4_MAP			GENMASK(19, 16)
++#define QUEUE5_MAP			GENMASK(23, 20)
++#define QUEUE6_MAP			GENMASK(27, 24)
++#define QUEUE7_MAP			GENMASK(31, 28)
++#define QUEUE8_MAP			GENMASK(3, 0)
++#define QUEUE9_MAP			GENMASK(7, 4)
++#define QUEUE10_MAP			GENMASK(11, 8)
++#define QUEUE11_MAP			GENMASK(15, 12)
++#define QUEUE12_MAP			GENMASK(19, 16)
++#define QUEUE13_MAP			GENMASK(23, 20)
++#define QUEUE14_MAP			GENMASK(27, 24)
++#define QUEUE15_MAP			GENMASK(31, 28)
++#define QUEUE16_MAP			GENMASK(3, 0)
++#define QUEUE17_MAP			GENMASK(7, 4)
++#define QUEUE18_MAP			GENMASK(11, 8)
++#define QUEUE19_MAP			GENMASK(15, 12)
++
++#define MT_WF_CFG(dev, ofs)		((dev)->regs[WF_CFG_BASE] + (ofs))
++
++#define MT_CFG_CCR(dev)			MT_WF_CFG(dev, 0x000)
++#define MT_CFG_CCR_MAC_D1_1X_GC_EN	BIT(24)
++#define MT_CFG_CCR_MAC_D0_1X_GC_EN	BIT(25)
++#define MT_CFG_CCR_MAC_D1_2X_GC_EN	BIT(30)
++#define MT_CFG_CCR_MAC_D0_2X_GC_EN	BIT(31)
++
++#define MT_WF_AGG(dev, ofs)		((dev)->regs[WF_AGG_BASE] + (ofs))
++
++#define MT_AGG_ARCR(dev)		MT_WF_AGG(dev, 0x010)
++#define MT_AGG_ARCR_INIT_RATE1		BIT(0)
++#define MT_AGG_ARCR_RTS_RATE_THR	GENMASK(12, 8)
++#define MT_AGG_ARCR_RATE_DOWN_RATIO	GENMASK(17, 16)
++#define MT_AGG_ARCR_RATE_DOWN_RATIO_EN	BIT(19)
++#define MT_AGG_ARCR_RATE_UP_EXTRA_TH	GENMASK(22, 20)
++
++#define MT_AGG_ARUCR(dev)		MT_WF_AGG(dev, 0x018)
++#define MT_AGG_ARDCR(dev)		MT_WF_AGG(dev, 0x01c)
++#define MT_AGG_ARXCR_LIMIT_SHIFT(_n)	(4 * (_n))
++#define MT_AGG_ARXCR_LIMIT(_n)		GENMASK(2 + \
++					MT_AGG_ARXCR_LIMIT_SHIFT(_n), \
++					MT_AGG_ARXCR_LIMIT_SHIFT(_n))
++
++#define MT_AGG_ACR0(dev)		MT_WF_AGG(dev, 0x070)
++#define MT_AGG_ACR_NO_BA_RULE		BIT(0)
++#define MT_AGG_ACR_NO_BA_AR_RULE	BIT(1)
++#define MT_AGG_ACR_PKT_TIME_EN		BIT(2)
++#define MT_AGG_ACR_CFEND_RATE		GENMASK(15, 4)
++#define MT_AGG_ACR_LDPC_UR_EN		BIT(16)
++#define MT_AGG_ACR_BAR_RATE		GENMASK(31, 20)
++
++#define MT_AGG_SCR(dev)			MT_WF_AGG(dev, 0x0fc)
++#define MT_AGG_SCR_NLNAV_MID_PTEC_DIS	BIT(3)
++
++#define MT_WF_TMAC(dev, ofs)		((dev)->regs[WF_TMAC_BASE] + (ofs))
++
++#define MT_TMAC_TRCR0(dev)		MT_WF_TMAC(dev, 0x09c)
++#define MT_TMAC_TRCR1(dev)		MT_WF_TMAC(dev, 0x070)
++#define MT_TMAC_TRCR_CCA_SEL		GENMASK(31, 30)
++#define MT_TMAC_TRCR_SEC_CCA_SEL	GENMASK(29, 28)
++
++#define MT_TMAC_CTCR0(dev)		MT_WF_TMAC(dev, 0x0f4)
++#define MT_TMAC_CTCR0_INS_DDLMT_REFTIME	GENMASK(5, 0)
++#define MT_TMAC_CTCR0_INS_DDLMT_DENSITY	GENMASK(15, 12)
++#define MT_TMAC_CTCR0_INS_DDLMT_EN	BIT(17)
++#define MT_TMAC_CTCR0_INS_DDLMT_VHT_SMPDU_EN	BIT(18)
++
++#define MT_WF_RMAC(dev, ofs)		((dev)->regs[WF_RMAC_BASE] + (ofs))
++
++#define MT_WF_RFCR(dev)			MT_WF_RMAC(dev, 0x000)
++#define MT_WF_RFCR_DROP_STBC_MULTI	BIT(0)
++#define MT_WF_RFCR_DROP_FCSFAIL		BIT(1)
++#define MT_WF_RFCR_DROP_VERSION		BIT(3)
++#define MT_WF_RFCR_DROP_PROBEREQ	BIT(4)
++#define MT_WF_RFCR_DROP_MCAST		BIT(5)
++#define MT_WF_RFCR_DROP_BCAST		BIT(6)
++#define MT_WF_RFCR_DROP_MCAST_FILTERED	BIT(7)
++#define MT_WF_RFCR_DROP_A3_MAC		BIT(8)
++#define MT_WF_RFCR_DROP_A3_BSSID	BIT(9)
++#define MT_WF_RFCR_DROP_A2_BSSID	BIT(10)
++#define MT_WF_RFCR_DROP_OTHER_BEACON	BIT(11)
++#define MT_WF_RFCR_DROP_FRAME_REPORT	BIT(12)
++#define MT_WF_RFCR_DROP_CTL_RSV		BIT(13)
++#define MT_WF_RFCR_DROP_CTS		BIT(14)
++#define MT_WF_RFCR_DROP_RTS		BIT(15)
++#define MT_WF_RFCR_DROP_DUPLICATE	BIT(16)
++#define MT_WF_RFCR_DROP_OTHER_BSS	BIT(17)
++#define MT_WF_RFCR_DROP_OTHER_UC	BIT(18)
++#define MT_WF_RFCR_DROP_OTHER_TIM	BIT(19)
++#define MT_WF_RFCR_DROP_NDPA		BIT(20)
++#define MT_WF_RFCR_DROP_UNWANTED_CTL	BIT(21)
++
++#define MT_WF_RFCR1(dev)		MT_WF_RMAC(dev, 0x004)
++#define MT_WF_RFCR1_DROP_ACK		BIT(4)
++#define MT_WF_RFCR1_DROP_BF_POLL	BIT(5)
++#define MT_WF_RFCR1_DROP_BA		BIT(6)
++#define MT_WF_RFCR1_DROP_CFEND		BIT(7)
++#define MT_WF_RFCR1_DROP_CFACK		BIT(8)
++
++#define MT_WF_RMAC_MIB_TIME0(dev)	MT_WF_RMAC(dev, 0x03c4)
++#define MT_WF_RMAC_MIB_RXTIME_CLR	BIT(31)
++#define MT_WF_RMAC_MIB_RXTIME_EN	BIT(30)
++
++#define MT_WF_RMAC_MIB_AIRTIME0(dev)	MT_WF_RMAC(dev, 0x0380)
++
++#define MT_WF_RMAC_MIB_TIME5(dev)	MT_WF_RMAC(dev, 0x03d8)
++#define MT_MIB_OBSSTIME_MASK		GENMASK(23, 0)
++
++#define MT_WF_DMA(dev, ofs)		((dev)->regs[WF_DMA_BASE] + (ofs))
++
++#define MT_DMA_DCR0(dev)		MT_WF_DMA(dev, 0x000)
++#define MT_DMA_DCR0_MAX_RX_LEN		GENMASK(15, 2)
++#define MT_DMA_DCR0_RX_VEC_DROP		BIT(17)
++
++#define MT_WTBL_ENTRY_SIZE		256
++
++#define MT_WTBL(dev, n)			((dev)->regs[WTBL_BASE] + (n))
++#define MT_WTBL_OFF(dev, n)		((dev)->regs[WTBL_OFF_BASE] + (n))
++
++#define MT_WTBL_W0_KEY_IDX		GENMASK(24, 23)
++#define MT_WTBL_W0_RX_KEY_VALID		BIT(26)
++#define MT_WTBL_W0_RX_IK_VALID		BIT(27)
++
++#define MT_WTBL_W2_KEY_TYPE		GENMASK(7, 4)
++
++#define MT_WTBL_UPDATE(dev)		MT_WTBL_OFF(dev, 0x030)
++#define MT_WTBL_UPDATE_WLAN_IDX		GENMASK(7, 0)
++#define MT_WTBL_UPDATE_RXINFO_UPDATE	BIT(11)
++#define MT_WTBL_UPDATE_ADM_COUNT_CLEAR	BIT(12)
++#define MT_WTBL_UPDATE_RATE_UPDATE	BIT(13)
++#define MT_WTBL_UPDATE_TX_COUNT_CLEAR	BIT(14)
++#define MT_WTBL_UPDATE_BUSY		BIT(31)
++
++#define MT_WTBL_ON(dev, _n)		((dev)->regs[WTBL_ON_BASE] + (_n))
++
++#define MT_WTBL_RICR0(dev)		MT_WTBL_ON(dev, 0x010)
++#define MT_WTBL_RICR1(dev)		MT_WTBL_ON(dev, 0x014)
++
++#define MT_WTBL_RIUCR0(dev)		MT_WTBL_ON(dev, 0x020)
++
++#define MT_WTBL_RIUCR1(dev)		MT_WTBL_ON(dev, 0x024)
++#define MT_WTBL_RIUCR1_RATE0		GENMASK(11, 0)
++#define MT_WTBL_RIUCR1_RATE1		GENMASK(23, 12)
++#define MT_WTBL_RIUCR1_RATE2_LO		GENMASK(31, 24)
++
++#define MT_WTBL_RIUCR2(dev)		MT_WTBL_ON(dev, 0x028)
++#define MT_WTBL_RIUCR2_RATE2_HI		GENMASK(3, 0)
++#define MT_WTBL_RIUCR2_RATE3		GENMASK(15, 4)
++#define MT_WTBL_RIUCR2_RATE4		GENMASK(27, 16)
++#define MT_WTBL_RIUCR2_RATE5_LO		GENMASK(31, 28)
++
++#define MT_WTBL_RIUCR3(dev)		MT_WTBL_ON(dev, 0x02c)
++#define MT_WTBL_RIUCR3_RATE5_HI		GENMASK(7, 0)
++#define MT_WTBL_RIUCR3_RATE6		GENMASK(19, 8)
++#define MT_WTBL_RIUCR3_RATE7		GENMASK(31, 20)
++
++#define MT_WTBL_W5_CHANGE_BW_RATE	GENMASK(7, 5)
++#define MT_WTBL_W5_SHORT_GI_20		BIT(8)
++#define MT_WTBL_W5_SHORT_GI_40		BIT(9)
++#define MT_WTBL_W5_SHORT_GI_80		BIT(10)
++#define MT_WTBL_W5_SHORT_GI_160		BIT(11)
++#define MT_WTBL_W5_BW_CAP		GENMASK(13, 12)
++#define MT_WTBL_W5_MPDU_FAIL_COUNT	GENMASK(25, 23)
++#define MT_WTBL_W5_MPDU_OK_COUNT	GENMASK(28, 26)
++#define MT_WTBL_W5_RATE_IDX		GENMASK(31, 29)
++
++#define MT_WTBL_W27_CC_BW_SEL		GENMASK(6, 5)
++
++#define MT_LPON(dev, _n)		((dev)->regs[LPON_BASE] + (_n))
++
++#define MT_LPON_T0CR(dev)		MT_LPON(dev, 0x010)
++#define MT_LPON_T0CR_MODE		GENMASK(1, 0)
++
++#define MT_LPON_UTTR0(dev)		MT_LPON(dev, 0x018)
++#define MT_LPON_UTTR1(dev)		MT_LPON(dev, 0x01c)
++
++#define MT_WF_MIB(dev, ofs)		((dev)->regs[WF_MIB_BASE] + (ofs))
++
++#define MT_MIB_M0_MISC_CR(dev)		MT_WF_MIB(dev, 0x00c)
++#define MT_MIB_MB_SDR0(dev, n)		MT_WF_MIB(dev, 0x100 + ((n) << 4))
++#define MT_MIB_RTS_RETRIES_COUNT_MASK	GENMASK(31, 16)
++#define MT_MIB_RTS_COUNT_MASK		GENMASK(15, 0)
++
++#define MT_MIB_SDR9(dev, n)		MT_WF_MIB(dev, 0x02c + ((n) << 9))
++#define MT_MIB_SDR9_BUSY_MASK		GENMASK(23, 0)
++
++#define MT_MIB_SDR16(dev, n)		MT_WF_MIB(dev, 0x48 + ((n) << 9))
++#define MT_MIB_BUSY_MASK		GENMASK(23, 0)
++
++#define MT_MIB_SDR36(dev, n)		MT_WF_MIB(dev, 0x098 + ((n) << 9))
++#define MT_MIB_SDR36_TXTIME_MASK	GENMASK(23, 0)
++#define MT_MIB_SDR37(dev, n)		MT_WF_MIB(dev, 0x09c + ((n) << 9))
++#define MT_MIB_SDR37_RXTIME_MASK	GENMASK(23, 0)
++
++#define MT_TX_AGG_CNT(n)		MT_WF_MIB(0xa8 + ((n) << 2))
++
++#endif
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/regs_dbg.h b/drivers/net/wireless/mediatek/mt76_new/mt7622/regs_dbg.h
+new file mode 100644
+index 00000000..f4f9fab
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/regs_dbg.h
+@@ -0,0 +1,632 @@
++/* SPDX-License-Identifier: ISC */
++/* Copyright (C) 2019 MediaTek Inc. */
++
++#ifndef __CONNAC_REGS_DBG_H
++#define __CONNAC_REGS_DBG_H
++
++#define MT_WTBL_BTCR_N		MT_WTBL_ON(0x100)
++#define MT_WTBL_BTBCR_N		MT_WTBL_ON(0x110)
++#define MT_WTBL_BRCR_N		MT_WTBL_ON(0x120)
++#define MT_WTBL_BRBCR_N		MT_WTBL_ON(0x130)
++#define MT_WTBL_BTDCR_N		MT_WTBL_ON(0x140)
++#define MT_WTBL_BRDCR_N		MT_WTBL_ON(0x150)
++
++#define MT_WTBL_MBTCR_N		MT_WTBL_ON(0x200)
++#define MT_WTBL_MBTBCR_N	MT_WTBL_ON(0x240)
++#define MT_WTBL_MBRCR_N		MT_WTBL_ON(0x280)
++#define MT_WTBL_MBRBCR_N	MT_WTBL_ON(0x2C0)
++
++#define WF_MIB_BASE		0x2d000
++#define MT_MIB(_n)			(WF_MIB_BASE + (_n))
++
++#define MT_MIB_M0SDR0			MT_MIB(0x10)
++#define MT_MIB_M0SDR0_BCN_TXCNT		GENMASK(15, 0)
++
++#define MT_MIB_M0DR0			MT_MIB(0xa0)
++#define MT_MIB_M0DR0_20MHZ_TXCNT	GENMASK(15, 0)
++#define MT_MIB_M0DR0_40MHZ_TXCNT	GENMASK(31, 16)
++
++#define MIB_M0SCR0	(WF_MIB_BASE + 0x00)
++#define MIB_M0PBSCR	(WF_MIB_BASE + 0x04)
++#define MIB_M0SCR1	(WF_MIB_BASE + 0x08)
++#define M0_MISC_CR	(WF_MIB_BASE + 0x0c)
++
++#define MIB_M0SDR0      (WF_MIB_BASE + 0x10)
++#define MIB_M0SDR3      (WF_MIB_BASE + 0x14)
++#define MIB_M0SDR4      (WF_MIB_BASE + 0x18)
++#define MIB_M0SDR5      (WF_MIB_BASE + 0x1c)
++#define MIB_M0SDR6      (WF_MIB_BASE + 0x20)
++#define MIB_M0SDR7      (WF_MIB_BASE + 0x24)
++#define MIB_M0SDR8      (WF_MIB_BASE + 0x28)
++#define MIB_M0SDR9      (WF_MIB_BASE + 0x2c)
++#define MIB_M0SDR10     (WF_MIB_BASE + 0x30)
++#define MIB_M0SDR11     (WF_MIB_BASE + 0x34)
++#define MIB_M0SDR12     (WF_MIB_BASE + 0x38)
++#define MIB_M0SDR14     (WF_MIB_BASE + 0x40)
++#define MIB_M0SDR15     (WF_MIB_BASE + 0x44)
++#define MIB_M0SDR16     (WF_MIB_BASE + 0x48)
++#define MIB_M0SDR17     (WF_MIB_BASE + 0x4c)
++#define MIB_M0SDR18     (WF_MIB_BASE + 0x50)
++#define MIB_M0SDR19     (WF_MIB_BASE + 0x54)
++#define MIB_M0SDR20     (WF_MIB_BASE + 0x58)
++#define MIB_M0SDR21     (WF_MIB_BASE + 0x5c)
++#define MIB_M0SDR22     (WF_MIB_BASE + 0x60)
++#define MIB_M0SDR23     (WF_MIB_BASE + 0x64)
++#define MIB_M0SDR29     (WF_MIB_BASE + 0x7c)
++
++#define MIB_M0SDR34 (WF_MIB_BASE + 0x90)
++#define MIB_M0SDR35 (WF_MIB_BASE + 0x94)
++
++#define MIB_M0SDR36      (WF_MIB_BASE + 0x98)
++#define MIB_M0SDR37      (WF_MIB_BASE + 0x9c)
++#define MIB_M0SDR51      (WF_MIB_BASE + 0x1E0)
++
++#define MIB_M0DR0       (WF_MIB_BASE + 0xa0)
++#define MIB_M0DR1       (WF_MIB_BASE + 0xa4)
++#define MIB_M0DR2       (WF_MIB_BASE + 0xa8)
++#define MIB_M0DR3       (WF_MIB_BASE + 0xac)
++#define MIB_M0DR4       (WF_MIB_BASE + 0xb0)
++#define MIB_M0DR5       (WF_MIB_BASE + 0xb4)
++
++#define MIB_M0DR6       (WF_MIB_BASE + 0xb8)
++
++#define TX_DDLMT_RNG1_CNT_MASK (0xff)
++#define GET_TX_DDLMT_RNG1_CNT(p) (((p) & TX_DDLMT_RNG1_CNT_MASK))
++#define TX_DDLMT_RNG2_CNT_MASK (0xff << 16)
++#define GET_TX_DDLMT_RNG2_CNT(p) (((p) & TX_DDLMT_RNG2_CNT_MASK) >> 16)
++
++#define MIB_M0DR7	(WF_MIB_BASE + 0xbc)
++#define TX_DDLMT_RNG3_CNT_MASK (0xff)
++#define GET_TX_DDLMT_RNG3_CNT(p) (((p) & TX_DDLMT_RNG3_CNT_MASK))
++#define TX_DDLMT_RNG4_CNT_MASK (0xff << 16)
++#define GET_TX_DDLMT_RNG4_CNT(p) (((p) & TX_DDLMT_RNG4_CNT_MASK) >> 16)
++
++#define MIB_M0DR8	(WF_MIB_BASE + 0xc0)
++#define MIB_M0DR9	(WF_MIB_BASE + 0xc4)
++#define MIB_M0DR10	(WF_MIB_BASE + 0xc8)
++#define MIB_M0DR11	(WF_MIB_BASE + 0xcc)
++
++#define MIB_MB0SDR0	(WF_MIB_BASE + 0x100)
++#define MIB_MB1SDR0	(WF_MIB_BASE + 0x110)
++#define MIB_MB2SDR0	(WF_MIB_BASE + 0x120)
++#define MIB_MB3SDR0	(WF_MIB_BASE + 0x130)
++
++#define MIB_MB0SDR1	(WF_MIB_BASE + 0x104)
++#define MIB_MB1SDR1	(WF_MIB_BASE + 0x114)
++#define MIB_MB2SDR1	(WF_MIB_BASE + 0x124)
++#define MIB_MB3SDR1	(WF_MIB_BASE + 0x134)
++
++#define MIB_MB0SDR2	(WF_MIB_BASE + 0x108)
++#define MIB_MB1SDR2	(WF_MIB_BASE + 0x118)
++#define MIB_MB2SDR2	(WF_MIB_BASE + 0x128)
++#define MIB_MB3SDR2	(WF_MIB_BASE + 0x138)
++
++#define MIB_MB0SDR3	(WF_MIB_BASE + 0x10c)
++#define MIB_MB1SDR3	(WF_MIB_BASE + 0x11c)
++#define MIB_MB2SDR3	(WF_MIB_BASE + 0x12c)
++#define MIB_MB3SDR3	(WF_MIB_BASE + 0x13c)
++
++#define MIB_MPDU_SR0	(WF_MIB_BASE + 0x190)
++#define MIB_MPDU_SR1	(WF_MIB_BASE + 0x194)
++
++#define MIB_M1SCR	(WF_MIB_BASE + 0x200)
++#define MIB_M1PBSCR	(WF_MIB_BASE + 0x204)
++#define MIB_M1SCR1	(WF_MIB_BASE + 0x208)
++#if 1//def TXRX_STAT_SUPPORT
++#define MIB_M1SDR0	(WF_MIB_BASE + 0x210)
++#endif
++#define MIB_M1SDR3	(WF_MIB_BASE + 0x214)
++#define MIB_M1SDR4	(WF_MIB_BASE + 0x218)
++#define MIB_M1SDR10	(WF_MIB_BASE + 0x230)
++#define MIB_M1SDR11	(WF_MIB_BASE + 0x234)
++#define MIB_M1SDR16	(WF_MIB_BASE + 0x248)
++#define MIB_M1SDR17	(WF_MIB_BASE + 0x24c)
++#define MIB_M1SDR18	(WF_MIB_BASE + 0x250)
++#define MIB_M1SDR20	(WF_MIB_BASE + 0x258)
++#define MIB_M1SDR34	(WF_MIB_BASE + 0x290) /* 820FD290 */
++#define MIB_M1SDR36	(WF_MIB_BASE + 0x298) /* 820FD298 */
++#define MIB_M1SDR37	(WF_MIB_BASE + 0x29c) /* 820FD29c */
++
++#define PSE_BASE		0xc000
++
++/* PSE Reset Control Register */
++#define PSE_RESET (PSE_BASE + 0x00)
++#define PSE_ALL_RST	BIT(0)
++#define PSE_LOGICAL_RST	BIT(1)
++#define PSE_INIT_DONE	BIT(2)
++#define GET_PSE_INIT_DONE(p) (((p) & PSE_INIT_DONE) >> 2)
++
++/* PSE Buffer Control Register */
++#define PSE_PBUF_CTRL (PSE_BASE + 0x14)
++#define PSE_TOTAL_PAGE_NUM_MASK (0xfff)
++#define PSE_GET_TOTAL_PAGE_NUM(p) (((p) & 0xfff))
++#define PSE_TOTAL_PAGE_CFG_MASK (0xf << 16)
++#define PSE_GET_TOTAL_PAGE_CFG(p) (((p) & PSE_TOTAL_PAGE_CFG_MASK) >> 16)
++
++#define PSE_PBUF_OFFSET_MASK (0xf << 20)
++#define GET_PSE_PBUF_OFFSET(p) (((p) & PSE_PBUF_OFFSET_MASK) >> 20)
++
++#define PSE_INT_N9_ERR_STS			(PSE_BASE + 0x28)
++
++/* Queue Empty */
++#define PSE_QUEUE_EMPTY			(PSE_BASE + 0xb0)
++
++/* Page Flow Control */
++#define PSE_FREEPG_CNT				(PSE_BASE + 0x100)
++
++#define PSE_FREEPG_HEAD_TAIL		(PSE_BASE + 0x104)
++
++#define PSE_PG_HIF0_GROUP			(PSE_BASE + 0x110)
++#define PSE_HIF0_PG_INFO			(PSE_BASE + 0x114)
++#define PSE_PG_HIF1_GROUP			(PSE_BASE + 0x118)
++#define PSE_HIF1_PG_INFO			(PSE_BASE + 0x11c)
++
++#define PSE_PG_CPU_GROUP			(PSE_BASE + 0x150)
++#define PSE_CPU_PG_INFO			    (PSE_BASE + 0x154)
++
++#define PSE_PG_LMAC0_GROUP			(PSE_BASE + 0x170)
++#define PSE_LMAC0_PG_INFO			(PSE_BASE + 0x174)
++#define PSE_PG_LMAC1_GROUP			(PSE_BASE + 0x178)
++#define PSE_LMAC1_PG_INFO			(PSE_BASE + 0x17c)
++#define PSE_PG_LMAC2_GROUP			(PSE_BASE + 0x180)
++#define PSE_LMAC2_PG_INFO			(PSE_BASE + 0x184)
++#define PSE_PG_PLE_GROUP			(PSE_BASE + 0x190)
++#define PSE_PLE_PG_INFO			    (PSE_BASE + 0x194)
++
++/* Indirect path for read/write */
++#define PSE_FL_QUE_CTRL_0			(PSE_BASE + 0x1b0)
++#define PSE_FL_QUE_CTRL_1			(PSE_BASE + 0x1b4)
++#define PSE_FL_QUE_CTRL_2			(PSE_BASE + 0x1b8)
++#define PSE_FL_QUE_CTRL_3			(PSE_BASE + 0x1bc)
++#define PSE_PL_QUE_CTRL_0			(PSE_BASE + 0x1c0)
++
++/* PSE spare dummy CR */
++#define PSE_SPARE_DUMMY_CR1			(PSE_BASE +  0x1e4)
++#define PSE_SPARE_DUMMY_CR2			(PSE_BASE +  0x1e8)
++#define PSE_SPARE_DUMMY_CR3			(PSE_BASE +  0x2e8)
++#define PSE_SPARE_DUMMY_CR4			(PSE_BASE +  0x2ec)
++
++#define PSE_SEEK_CR_00			(PSE_BASE + 0x3d0)
++#define PSE_SEEK_CR_01			(PSE_BASE + 0x3d4)
++#define PSE_SEEK_CR_02			(PSE_BASE + 0x3d8)
++#define PSE_SEEK_CR_03			(PSE_BASE + 0x3dc)
++#define PSE_SEEK_CR_04			(PSE_BASE + 0x3e0)
++#define PSE_SEEK_CR_05			(PSE_BASE + 0x3e4)
++#define PSE_SEEK_CR_06			(PSE_BASE + 0x3e8)
++#define PSE_SEEK_CR_08			(PSE_BASE + 0x3f0)
++
++/* CPU Interface Get First Frame ID Control Regitser */
++#define C_GFF (PSE_BASE + 0x24)
++#define GET_FIRST_FID_MASK (0xfff)
++#define GET_FIRST_FID(p) (((p) & GET_FIRST_FID_MASK))
++#define GET_QID_MASK (0x1f << 16)
++#define SET_GET_QID(p) (((p) & 0x1f) << 16)
++#define GET_QID(p) (((p) & GET_QID_MASK) >> 16)
++#define GET_PID_MASK (0x3 << 21)
++#define SET_GET_PID(p) (((p) & 0x3) << 21)
++#define GET_PID(p) (((p) & GET_PID_MASK) >> 21)
++#define GET_RVSE_MASK	BIT(23)
++#define SET_GET_RVSE(p) (((p) & 0x1) << 23)
++#define GET_RVSE(p) (((p) & GET_RVSE_MASK) >> 23)
++
++/* CPU Interface Get Frame ID Control Register */
++#define C_GF (PSE_BASE + 0x28)
++#define GET_RETURN_FID_MASK (0xfff)
++#define GET_RETURN_FID(p) (((p) & GET_RETURN_FID_MASK))
++#define CURR_FID_MASK (0xfff << 16)
++#define SET_CURR_FID(p) (((p) & 0xfff) << 16)
++#define GET_CURR_FID(p) (((p) & CURR_FID_MASK) >> 16)
++#define GET_PREV_MASK	BIT(28)
++#define SET_GET_PREV(p) (((p) & 0x1) << 28)
++#define GET_PREV(p) (((p) & GET_PREV_MASK) >> 28)
++#define GET_AUTO_MASK	BIT(29)
++#define SET_GET_AUTO(p) (((p) & 0x1) >> 29)
++#define GET_AUTO(p) (((p) & GET_AUTO_MASK) >> 29)
++
++/* Get Queue Length Control Register */
++#define GQC (PSE_BASE + 0x118)
++#define QLEN_RETURN_VALUE_MASK (0xfff)
++#define GET_QLEN_RETURN_VALUE(p) (((p) & QLEN_RETURN_VALUE_MASK))
++#define GET_QLEN_QID_MASK (0x1f << 16)
++#define SET_GET_QLEN_QID(p) (((p) & 0x1f) << 16)
++#define GET_QLEN_QID(p) (((p) & GET_QLEN_QID_MASK) >> 16)
++#define GET_QLEN_PID_MASK (0x3 << 21)
++#define SET_GET_QLEN_PID(p) (((p) & 0x3) << 21)
++#define GET_QLEN_PID(p) (((p) & GET_QLEN_PID_MASK) >> 21)
++#define QLEN_IN_PAGE	BIT(23)
++#define GET_QLEN_IN_PAGE(p) (((p) & QLEN_IN_PAGE) >> 23)
++
++/* Flow Control P0 Control Register */
++#define FC_P0 (PSE_BASE + 0x120)
++#define MIN_RSRV_P0_MASK (0xfff)
++#define MIN_RSRV_P0(p) (((p) & 0xfff))
++#define GET_MIN_RSRV_P0(p) (((p) & MIN_RSRV_P0_MASK))
++#define MAX_QUOTA_P0_MASK (0xfff << 16)
++#define MAX_QUOTA_P0(p) (((p) & 0xfff) << 16)
++#define GET_MAX_QUOTA_P0(p) (((p) & MAX_QUOTA_P0_MASK) >> 16)
++
++/* Flow Control P1 Control Register */
++#define FC_P1 (PSE_BASE + 0x124)
++#define MIN_RSRV_P1_MASK (0xfff)
++#define MIN_RSRV_P1(p) (((p) & 0xfff))
++#define GET_MIN_RSRV_P1(p) (((p) & MIN_RSRV_P1_MASK))
++#define MAX_QUOTA_P1_MASK (0xfff << 16)
++#define MAX_QUOTA_P1(p) (((p) & 0xfff) << 16)
++#define GET_MAX_QUOTA_P1(p) (((p) & MAX_QUOTA_P1_MASK) >> 16)
++
++/* Flow Control P2_RQ0 Control Register */
++#define FC_P2Q0 (PSE_BASE + 0x128)
++#define MIN_RSRV_P2_RQ0_MASK (0xfff)
++#define MIN_RSRV_P2_RQ0(p) (((p) & 0xfff))
++#define GET_MIN_RSRV_P2_RQ0(p) (((p) & MIN_RSRV_P2_RQ0_MASK))
++#define MAX_QUOTA_P2_RQ0_MASK (0xfff << 16)
++#define MAX_QUOTA_P2_RQ0(p) (((p) & 0xfff) << 16)
++#define GET_MAX_QUOTA_P2_RQ0(p) (((p) & MAX_QUOTA_P2_RQ0_MASK) >> 16)
++
++/* Flow Control P2_RQ1 Control Register */
++#define FC_P2Q1 (PSE_BASE + 0x12c)
++#define MIN_RSRV_P2_RQ1_MASK (0xfff)
++#define MIN_RSRV_P2_RQ1(p) (((p) & 0xfff))
++#define GET_MIN_RSRV_P2_RQ1(p) (((p) & MIN_RSRV_P2_RQ1_MASK))
++#define MAX_QUOTA_P2_RQ1_MASK (0xfff << 16)
++#define MAX_QUOTA_P2_RQ1(p) (((p) & 0xfff) << 16)
++#define GET_MAX_QUOTA_P2_RQ1(p) (((p) & MAX_QUOTA_P2_RQ1_MASK) >> 16)
++
++/* Flow Control P2_RQ2 Control Register */
++#define FC_P2Q2 (PSE_BASE + 0x130)
++#define MIN_RSRV_P2_RQ2_MASK (0xfff)
++#define MIN_RSRV_P2_RQ2(p) (((p) & 0xfff))
++#define GET_MIN_RSRV_P2_RQ2(p) (((p) & MIN_RSRV_P2_RQ2_MASK))
++#define MAX_QUOTA_P2_RQ2_MASK (0xfff << 16)
++#define MAX_QUOTA_P2_RQ2(p) (((p) & 0xfff) << 16)
++#define GET_MAX_QUOTA_P2_RQ2(p) (((p) & MAX_QUOTA_P2_RQ2_MASK) >> 16)
++
++/* Flow Control Free for All and Free Page Counter Register */
++#define FC_FFC (PSE_BASE + 0x134)
++#define FREE_PAGE_CNT_MASK (0xfff)
++#define GET_FREE_PAGE_CNT(p) (((p) & FREE_PAGE_CNT_MASK))
++#define FFA_CNT_MASK (0xfff << 16)
++#define GET_FFA_CNT(p) (((p) & FFA_CNT_MASK) >> 16)
++
++/* Flow Control Reserve from FFA priority Control Register */
++#define FC_FRP (PSE_BASE + 0x138)
++#define RSRV_PRI_P0_MASK (0x7)
++#define RSRV_PRI_P0(p) (((p) & 0x7))
++#define GET_RSRV_PRI_P0(p) (((p) & RSRV_PRI_P0_MASK))
++#define RSRV_PRI_P1_MASK (0x7 << 3)
++#define RSRV_PRI_P1(p) (((p) & 0x7) << 3)
++#define GET_RSRV_PRI_P1(p) (((p) & RSRV_PRI_P1_MASK) >> 3)
++#define RSRV_PRI_P2_RQ0_MASK (0x7 << 6)
++#define RSRV_PRI_P2_RQ0(p) (((p) & 0x7) << 6)
++#define GET_RSRV_PRI_P2_RQ0(p) (((p) & RSRV_PRI_P2_RQ0_MASK) >> 6)
++#define RSRV_PRI_P2_RQ1_MASK (0x7 << 9)
++#define RSRV_PRI_P2_RQ1(p) (((p) & 0x7) << 9)
++#define GET_RSRV_PRI_P2_RQ1(p) (((p) & RSRV_PRI_P2_RQ1_MASK) >> 9)
++#define RSRV_PRI_P2_RQ2_MASK (0x7 << 12)
++#define RSRV_PRI_P2_RQ2(p) (((p) & 0x7) << 12)
++#define GET_RSRV_PRI_P2_RQ2(p) (((p) & RSRV_PRI_P2_RQ2_MASK) >> 12)
++
++/* Flow Control P0 and P1 Reserve Counter Register */
++#define FC_RP0P1 (PSE_BASE + 0x13c)
++#define RSRV_CNT_P0_MASK (0xfff)
++#define RSRV_CNT_P0(p) (((p) & 0xfff))
++#define GET_RSRV_CNT_P0(p) (((p) & RSRV_CNT_P0_MASK))
++#define RSRV_CNT_P1_MASK (0xfff << 16)
++#define RSRV_CNT_P1(p) (((p) & 0xfff) << 16)
++#define GET_RSRV_CNT_P1(p) (((p) & RSRV_CNT_P1_MASK) >> 16)
++
++/* Flow Control P2_RQ0 and P2_RQ1 Reserve Counter Register */
++#define FC_RP2Q0Q1 (PSE_BASE + 0x140)
++#define RSRV_CNT_P2_RQ0_MASK (0xfff)
++#define RSRV_CNT_P2_RQ0(p) (((p) & 0xfff))
++#define GET_RSRV_CNT_P2_RQ0(p) (((p) & RSRV_CNT_P2_RQ0_MASK))
++#define RSRV_CNT_P2_RQ1_MASK (0xfff << 16)
++#define RSRV_CNT_P2_RQ1(p) (((p) & 0xfff) << 16)
++#define GET_RSRV_CNT_P2_RQ1(p) (((p) & RSRV_CNT_P2_RQ1_MASK) >> 16)
++
++/* Flow Control P2_RQ2 Reserve Counter Register */
++#define FC_RP2Q2 (PSE_BASE + 0x144)
++#define RSRV_CNT_P2_RQ2_MASK (0xfff)
++#define RSRV_CNT_P2_RQ2(p) (((p) & 0xfff))
++#define GET_RSRV_CNT_P2_RQ2(p) (((p) & RSRV_CNT_P2_RQ2_MASK))
++
++/* Flow Control P0 and P1 Source Counter Register */
++#define FC_SP0P1 (PSE_BASE + 0x148)
++#define SRC_CNT_P0_MASK (0xfff)
++#define GET_SRC_CNT_P0(p) (((p) & SRC_CNT_P0_MASK))
++#define SRC_CNT_P1_MASK (0xfff << 16)
++#define GET_SRC_CNT_P1(p) (((p) & SRC_CNT_P1_MASK) >> 16)
++
++/* FLow Control P2_RQ0 and P2_RQ1 Source Counter Register */
++#define FC_SP2Q0Q1 (PSE_BASE + 0x14c)
++#define SRC_CNT_P2_RQ0_MASK (0xfff)
++#define GET_SRC_CNT_P2_RQ0(p) (((p) & SRC_CNT_P2_RQ0_MASK))
++#define SRC_CNT_P2_RQ1_MASK (0xfff << 16)
++#define GET_SRC_CNT_P2_RQ1(p) (((p) & SRC_CNT_P2_RQ1_MASK) >> 16)
++
++/* Flow Control P2_RQ2 Source Counter Register */
++#define FC_SP2Q2 (PSE_BASE + 0x150)
++#define SRC_CNT_P2_RQ2_MASK (0xfff)
++#define GET_SRC_CNT_P2_RQ2(p) (((p) & 0xfff))
++
++#define PSE_RTA (PSE_BASE + 0x194)
++#define PSE_RTA_RD_RULE_QID_MASK (0x1f)
++#define PSE_RTA_RD_RULE_QID(p) (((p) & 0x1f))
++#define GET_PSE_RTA_RD_RULE_QID(p) (((p) & PSE_RTA_RD_RULE_QID_MASK))
++#define PSE_RTA_RD_RULE_PID_MASK (0x3 << 5)
++#define PSE_RTA_RD_RULE_PID(p) (((p) & 0x3) << 5)
++#define GET_PSE_RTA_RD_RULE_PID(p) (((p) & PSE_RTA_RD_RULE_PID_MASK) >> 5)
++#define PSE_RTA_RD_RULE_F	BIT(7)
++#define GET_PSE_RTA_RD_RULE_F(p) (((p) & PSE_RTA_RD_RULE_F) >> 7)
++#define PSE_RTA_TAG_MASK (0xff << 8)
++#define PSE_RTA_TAG(p) (((p) & 0xff) << 8)
++#define GET_PSE_RTA_TAG(p) (((p) & PSE_RTA_TAG_MASK) >> 8)
++#define PSE_RTA_RD_RW	BIT(16)
++#define PSE_RTA_RD_KICK_BUSY	BIT(31)
++#define GET_PSE_RTA_RD_KICK_BUSY(p) (((p) & PSE_RTA_RD_KICK_BUSY) >> 31)
++
++#define PLE_BASE		0x8000
++
++/* PLE Buffer Control Register */
++#define PLE_PBUF_CTRL				(PLE_BASE + 0x14)
++#define PLE_TOTAL_PAGE_NUM_MASK	(0xfff)
++#define PLE_GET_TOTAL_PAGE_NUM(p) (((p) & 0xfff))
++#define PLE_TOTAL_PAGE_CFG_MASK	(0xf << 16)
++#define PLE_GET_TOTAL_PAGE_CFG(p) (((p) & PSE_TOTAL_PAGE_CFG_MASK) >> 16)
++#define PLE_PBUF_OFFSET_MASK		(0xf << 20)
++#define GET_PLE_PBUF_OFFSET(p)	(((p) & PSE_PBUF_OFFSET_MASK) >> 20)
++
++/* Release Control */
++#define PLE_RELEASE_CTRL				(PLE_BASE + 0x30)
++#define PLE_NORMAL_TX_RLS_QID_MASK	(0x1f)
++#define GET_PLE_NORMAL_TX_RLS_QID(p)	(((p) & GET_FIRST_FID_MASK))
++#define PLE_NORMAL_TX_RLS_PID_MASK	(0x3 << 6)
++#define GET_PLE_NORMAL_TX_RLS_PID(p) (((p) & PLE_NORMAL_TX_RLS_PID_MASK) >> 6)
++
++#define BCNX_RLS_QID_MASK    (0x1f)
++#define BCNX_RLS_PID_MASK    (0x3)
++#define SET_BCN0_RLS_QID(p)  (((p) & BCNX_RLS_QID_MASK) << 16)
++#define SET_BCN0_RLS_PID(p)  (((p) & BCNX_RLS_PID_MASK) << 22)
++#define SET_BCN1_RLS_QID(p)  (((p) & BCNX_RLS_QID_MASK) << 24)
++#define SET_BCN1_RLS_PID(p)  (((p) & BCNX_RLS_PID_MASK) << 30)
++
++#define PLE_INT_N9_ERR_STS (PLE_BASE + 0x28)
++
++/* HIF Report Control */
++#define PLE_HIF_REPORT				(PLE_BASE + 0x34)
++
++/* CPU Interface get frame ID Control */
++#define PLE_C_GET_FID_0				(PLE_BASE + 0x40)
++
++/* CPU Interface get frame ID Control */
++#define PLE_C_GET_FID_1				(PLE_BASE + 0x44)
++
++#define PLE_C_EN_QUEUE_0                (PLE_BASE + 0x60)
++#define PLE_C_EN_QUEUE_1                (PLE_BASE + 0x64)
++#define PLE_C_EN_QUEUE_2                (PLE_BASE + 0x68)
++
++#define PLE_C_DE_QUEUE_0                (PLE_BASE + 0x80)
++#define PLE_C_DE_QUEUE_1                (PLE_BASE + 0x84)
++#define PLE_C_DE_QUEUE_2                (PLE_BASE + 0x88)
++#define PLE_C_DE_QUEUE_3                (PLE_BASE + 0x8c)
++
++#define PLE_TO_N9_INT                   (PLE_BASE + 0xf0)
++#define PLE_TO_N9_INT_TOGGLE_MASK 0x80000000
++
++/* Queue Empty */
++#define PLE_QUEUE_EMPTY			(PLE_BASE + 0xb0)
++
++#define WF_PLE_TOP_TP_LMAC_EN	(PLE_BASE + 0x220)
++
++#define PLE_AC0_QUEUE_EMPTY_0		(PLE_BASE + 0x300)
++#define PLE_AC0_QUEUE_EMPTY_1		(PLE_BASE + 0x304)
++#define PLE_AC0_QUEUE_EMPTY_2		(PLE_BASE + 0x308)
++#define PLE_AC0_QUEUE_EMPTY_3		(PLE_BASE + 0x30c)
++
++#define PLE_AC1_QUEUE_EMPTY_0		(PLE_BASE + 0x310)
++#define PLE_AC1_QUEUE_EMPTY_1		(PLE_BASE + 0x314)
++#define PLE_AC1_QUEUE_EMPTY_2		(PLE_BASE + 0x318)
++#define PLE_AC1_QUEUE_EMPTY_3		(PLE_BASE + 0x31c)
++
++#define PLE_AC2_QUEUE_EMPTY_0		(PLE_BASE + 0x320)
++#define PLE_AC2_QUEUE_EMPTY_1		(PLE_BASE + 0x324)
++#define PLE_AC2_QUEUE_EMPTY_2		(PLE_BASE + 0x328)
++#define PLE_AC2_QUEUE_EMPTY_3		(PLE_BASE + 0x32c)
++
++#define PLE_AC3_QUEUE_EMPTY_0		(PLE_BASE + 0x330)
++#define PLE_AC3_QUEUE_EMPTY_1		(PLE_BASE + 0x334)
++#define PLE_AC3_QUEUE_EMPTY_2		(PLE_BASE + 0x338)
++#define PLE_AC3_QUEUE_EMPTY_3		(PLE_BASE + 0x33c)
++#define PLE_WF_PLE_PEEK_CR_0		(PLE_BASE + 0x3D0)
++#define PLE_WF_PLE_PEEK_CR_1		(PLE_BASE + 0x3D4)
++#define PLE_WF_PLE_PEEK_CR_2		(PLE_BASE + 0x3D8)
++#define PLE_WF_PLE_PEEK_CR_3		(PLE_BASE + 0x3DC)
++#define PLE_WF_PLE_PEEK_CR_4		(PLE_BASE + 0x3E0)
++#define PLE_WF_PLE_PEEK_CR_5		(PLE_BASE + 0x3E4)
++#define PLE_WF_PLE_PEEK_CR_6		(PLE_BASE + 0x3E8)
++#define PLE_WF_PLE_PEEK_CR_7		(PLE_BASE + 0x3EC)
++#define PLE_WF_PLE_PEEK_CR_8		(PLE_BASE + 0x3F0)
++#define PLE_WF_PLE_PEEK_CR_9		(PLE_BASE + 0x3F4)
++#define PLE_WF_PLE_PEEK_CR_10		(PLE_BASE + 0x3F8)
++#define PLE_WF_PLE_PEEK_CR_11		(PLE_BASE + 0x3FC)
++
++#define PLE_AC0_QUEUE_EMPTY_4           (PLE_BASE + 0x600)
++#define PLE_AC0_QUEUE_EMPTY_5           (PLE_BASE + 0x604)
++#define PLE_AC0_QUEUE_EMPTY_6           (PLE_BASE + 0x608)
++#define PLE_AC0_QUEUE_EMPTY_7           (PLE_BASE + 0x60c)
++
++#define PLE_AC1_QUEUE_EMPTY_4           (PLE_BASE + 0x610)
++#define PLE_AC1_QUEUE_EMPTY_5           (PLE_BASE + 0x614)
++#define PLE_AC1_QUEUE_EMPTY_6           (PLE_BASE + 0x618)
++#define PLE_AC1_QUEUE_EMPTY_7           (PLE_BASE + 0x61c)
++
++#define PLE_AC2_QUEUE_EMPTY_4           (PLE_BASE + 0x620)
++#define PLE_AC2_QUEUE_EMPTY_5           (PLE_BASE + 0x624)
++#define PLE_AC2_QUEUE_EMPTY_6           (PLE_BASE + 0x628)
++#define PLE_AC2_QUEUE_EMPTY_7           (PLE_BASE + 0x62c)
++
++#define PLE_AC3_QUEUE_EMPTY_4           (PLE_BASE + 0x630)
++#define PLE_AC3_QUEUE_EMPTY_5           (PLE_BASE + 0x634)
++#define PLE_AC3_QUEUE_EMPTY_6           (PLE_BASE + 0x638)
++#define PLE_AC3_QUEUE_EMPTY_7           (PLE_BASE + 0x63c)
++
++#define PLE_STATION_PAUSE0		(PLE_BASE + 0x360)
++#define PLE_STATION_PAUSE1		(PLE_BASE + 0x364)
++#define PLE_STATION_PAUSE2		(PLE_BASE + 0x368)
++#define PLE_STATION_PAUSE3		(PLE_BASE + 0x36C)
++
++/* Page Flow Control */
++#define PLE_FREEPG_CNT				(PLE_BASE + 0x100)
++
++#define PLE_FREEPG_HEAD_TAIL		(PLE_BASE + 0x104)
++
++#define PLE_PG_HIF_GROUP			(PLE_BASE + 0x110)
++#define PLE_HIF_PG_INFO				(PLE_BASE + 0x114)
++
++#define PLE_PG_CPU_GROUP			(PLE_BASE + 0x150)
++#define PLE_CPU_PG_INFO			(PLE_BASE + 0x154)
++
++/* Indirect path for read/write */
++#define PLE_FL_QUE_CTRL_0			(PLE_BASE + 0x1b0)
++#define PLE_FL_QUE_CTRL_1			(PLE_BASE + 0x1b4)
++#define PLE_FL_QUE_CTRL_2			(PLE_BASE + 0x1b8)
++#define PLE_FL_QUE_CTRL_3			(PLE_BASE + 0x1bc)
++#define PLE_PL_QUE_CTRL_0			(PLE_BASE + 0x1c0)
++
++/* Disable Station control */
++#define DIS_STA_MAP0			(PLE_BASE + 0x260)
++#define DIS_STA_MAP1			(PLE_BASE + 0x264)
++#define DIS_STA_MAP2			(PLE_BASE + 0x268)
++#define DIS_STA_MAP3			(PLE_BASE + 0x26c)
++
++#define DIS_STA_MAP4                    (PLE_BASE + 0x270)
++#define DIS_STA_MAP5                    (PLE_BASE + 0x274)
++#define DIS_STA_MAP6                    (PLE_BASE + 0x278)
++#define DIS_STA_MAP7                    (PLE_BASE + 0x27c)
++
++/* Station Pause control register */
++#define STATION_PAUSE0			(PLE_BASE + 0x360)
++#define STATION_PAUSE1			(PLE_BASE + 0x364)
++#define STATION_PAUSE2			(PLE_BASE + 0x368)
++#define STATION_PAUSE3			(PLE_BASE + 0x36c)
++
++#define STATION_PAUSE4                  (PLE_BASE + 0x660)
++#define STATION_PAUSE5                  (PLE_BASE + 0x664)
++#define STATION_PAUSE6                  (PLE_BASE + 0x668)
++#define STATION_PAUSE7                  (PLE_BASE + 0x66c)
++
++/* VOW Ctrl */
++#define VOW_RESET_DISABLE	BIT(26)
++#define STA_MAX_DEFICIT_MASK    (0x0000FFFF)
++#define VOW_DBDC_BW_GROUP_CTRL  (PLE_BASE + 0x2ec)
++#define VOW_CONTROL             (PLE_BASE + 0x370)
++#define AIRTIME_DRR_SIZE        (PLE_BASE + 0x374)
++
++#define PLE_TX_DELAY_CTRL		(PLE_BASE + 0x440)
++#define PLE_TX_DELAY_TIME_THRES_MASK	(0xff)
++#define PLE_TX_DELAY_PAGE_THRES_MASK	(0xfff)
++#define SET_PLE_TX_DELAY_TIME_THRES(p)  \
++	(((p) & PLE_TX_DELAY_TIME_THRES_MASK) << 16)
++#define SET_PLE_TX_DELAY_PAGE_THRES(p)  (((p) & PLE_TX_DELAY_PAGE_THRES_MASK))
++
++//----------------------------------------
++// DMASHDL
++//----------------------------------------
++#define MT_HIF_DMASHDL_SLOT_SET0	(DMASHDL_BASE + 0xc4)
++#define MT_HIF_DMASHDL_SLOT_SET1	(DMASHDL_BASE + 0xc8)
++
++#define MT_HIF_DMASHDL_PAGE_SET		(DMASHDL_BASE + 0x0c)
++
++/* User program group sequence type control,
++ * 0: user program group sequence order type;
++ * 1: pre define each slot group strict order
++ */
++#define DMASHDL_GROUP_SEQ_ORDER_TYPE   BIT(16)
++
++#define MT_HIF_DMASHDL_CTRL_SIGNAL      (DMASHDL_BASE + 0x18)
++
++/* enable to clear the flag of PLE TXD size greater than ple max. size */
++#define DMASHDL_PLE_TXD_GT_MAX_SIZE_FLAG_CLR BIT(0)
++
++/* enable packet in substration action from HIF ask period */
++#define DMASHDL_HIF_ASK_SUB_ENA        BIT(16)
++
++/* enable packet in substration action from PLE */
++#define DMASHDL_PLE_SUB_ENA            BIT(17)
++
++/* enable terminate refill period when PLE release packet to do addition */
++#define DMASHDL_PLE_ADD_INT_REFILL_ENA BIT(29)
++
++/* enable terminate refill period when packet in to do addition */
++#define DMASHDL_PDMA_ADD_INT_REFILL_ENA BIT(30)
++
++/* enable terminate refill period when packet in to do substration */
++#define DMASHDL_PKTIN_INT_REFILL_ENA   BIT(31)
++
++#define MT_HIF_DMASHDL_ERROR_FLAG_CTRL  (DMASHDL_BASE + 0x9c)
++
++#define MT_HIF_DMASHDL_STATUS_RD        (DMASHDL_BASE + 0x100)
++#define MT_HIF_DMASHDL_STATUS_RD_GP0    (DMASHDL_BASE + 0x140)
++#define MT_HIF_DMASHDL_STATUS_RD_GP1    (DMASHDL_BASE + 0x144)
++#define MT_HIF_DMASHDL_STATUS_RD_GP2    (DMASHDL_BASE + 0x148)
++#define MT_HIF_DMASHDL_STATUS_RD_GP3    (DMASHDL_BASE + 0x14c)
++#define MT_HIF_DMASHDL_STATUS_RD_GP4    (DMASHDL_BASE + 0x150)
++#define MT_HIF_DMASHDL_STATUS_RD_GP5    (DMASHDL_BASE + 0x154)
++#define MT_HIF_DMASHDL_STATUS_RD_GP6    (DMASHDL_BASE + 0x158)
++#define MT_HIF_DMASHDL_STATUS_RD_GP7    (DMASHDL_BASE + 0x15c)
++#define MT_HIF_DMASHDL_STATUS_RD_GP8    (DMASHDL_BASE + 0x160)
++#define MT_HIF_DMASHDL_STATUS_RD_GP9    (DMASHDL_BASE + 0x164)
++#define MT_HIF_DMASHDL_STATUS_RD_GP10   (DMASHDL_BASE + 0x168)
++#define MT_HIF_DMASHDL_STATUS_RD_GP11   (DMASHDL_BASE + 0x16c)
++#define MT_HIF_DMASHDL_STATUS_RD_GP12   (DMASHDL_BASE + 0x170)
++#define MT_HIF_DMASHDL_STATUS_RD_GP13   (DMASHDL_BASE + 0x174)
++#define MT_HIF_DMASHDL_STATUS_RD_GP14   (DMASHDL_BASE + 0x178)
++#define MT_HIF_DMASHDL_STATUS_RD_GP15   (DMASHDL_BASE + 0x17c)
++#define MT_HIF_DMASHDLRD_GP_PKT_CNT_0   (DMASHDL_BASE + 0x180)
++#define MT_HIF_DMASHDLRD_GP_PKT_CNT_1   (DMASHDL_BASE + 0x184)
++#define MT_HIF_DMASHDLRD_GP_PKT_CNT_2   (DMASHDL_BASE + 0x188)
++#define MT_HIF_DMASHDLRD_GP_PKT_CNT_3   (DMASHDL_BASE + 0x18c)
++#define MT_HIF_DMASHDLRD_GP_PKT_CNT_4   (DMASHDL_BASE + 0x190)
++#define MT_HIF_DMASHDLRD_GP_PKT_CNT_5   (DMASHDL_BASE + 0x194)
++#define MT_HIF_DMASHDLRD_GP_PKT_CNT_6   (DMASHDL_BASE + 0x198)
++#define MT_HIF_DMASHDLRD_GP_PKT_CNT_7   (DMASHDL_BASE + 0x19c)
++
++#define DMASHDL_RSV_CNT_MASK           (0xfff << 16)
++#define DMASHDL_SRC_CNT_MASK           (0xfff << 0)
++#define DMASHDL_RSV_CNT_OFFSET         16
++#define DMASHDL_SRC_CNT_OFFSET         0
++#define DMASHDL_FREE_PG_CNT_MASK       (0xfff << 16)
++#define DMASHDL_FFA_CNT_MASK           (0xfff << 0)
++#define DMASHDL_FREE_PG_CNT_OFFSET     16
++#define DMASHDL_FFA_CNT_OFFSET         0
++
++#define ODD_GROUP_ASK_CN_MASK (0xff << 16)
++#define ODD_GROUP_ASK_CN_OFFSET 16
++#define GET_ODD_GROUP_ASK_CNT(p) \
++	(((p) & ODD_GROUP_ASK_CN_MASK) >> ODD_GROUP_ASK_CN_OFFSET)
++#define ODD_GROUP_PKT_IN_CN_MASK (0xff << 24)
++#define ODD_GROUP_PKT_IN_CN_OFFSET 24
++#define GET_ODD_GROUP_PKT_IN_CNT(p) \
++	(((p) & ODD_GROUP_PKT_IN_CN_MASK) >> ODD_GROUP_PKT_IN_CN_OFFSET)
++#define EVEN_GROUP_ASK_CN_MASK (0xff << 0)
++#define EVEN_GROUP_ASK_CN_OFFSET 0
++#define GET_EVEN_GROUP_ASK_CNT(p) \
++	(((p) & EVEN_GROUP_ASK_CN_MASK) >> EVEN_GROUP_ASK_CN_OFFSET)
++#define EVEN_GROUP_PKT_IN_CN_MASK (0xff << 8)
++#define EVEN_GROUP_PKT_IN_CN_OFFSET 8
++#define GET_EVEN_GROUP_PKT_IN_CNT(p) \
++	(((p) & EVEN_GROUP_PKT_IN_CN_MASK) >> EVEN_GROUP_PKT_IN_CN_OFFSET)
++
++//-----------------------
++// HIF
++//-----------------------
++#define CONN_HIF_PDMA_TX_RING0_BASE		MT_HIF(0x300)
++#define CONN_HIF_PDMA_TX_RING1_BASE		MT_HIF(0x310)
++#define CONN_HIF_PDMA_TX_RING2_BASE		MT_HIF(0x320)
++#define CONN_HIF_PDMA_TX_RING3_BASE		MT_HIF(0x330)
++#define CONN_HIF_PDMA_TX_RING4_BASE		MT_HIF(0x340)
++#define CONN_HIF_PDMA_TX_RING5_BASE		MT_HIF(0x350)
++#define CONN_HIF_PDMA_TX_RING15_BASE	MT_HIF(0x3f0)
++#define CONN_HIF_PDMA_RX_RING0_BASE		MT_HIF(0x400)
++#define CONN_HIF_PDMA_RX_RING1_BASE		MT_HIF(0x410)
++#endif
+diff --git a/drivers/net/wireless/mediatek/mt76_new/mt7622/soc.c b/drivers/net/wireless/mediatek/mt76_new/mt7622/soc.c
+new file mode 100644
+index 00000000..367c8f4
+--- /dev/null
++++ b/drivers/net/wireless/mediatek/mt76_new/mt7622/soc.c
+@@ -0,0 +1,143 @@
++// SPDX-License-Identifier: ISC
++/* Copyright (C) 2019 MediaTek Inc.
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++
++#include "mt7622.h"
++#include "mac.h"
++
++static void
++mt7622_rx_poll_complete(struct mt76_dev *mdev, enum mt76_rxq_id q)
++{
++	struct mt7622_dev *dev = container_of(mdev, struct mt7622_dev, mt76);
++
++	mt7622_irq_enable(dev, MT_INT_RX_DONE(q));
++}
++
++static irqreturn_t mt7622_irq_handler(int irq, void *dev_instance)
++{
++	struct mt7622_dev *dev = dev_instance;
++	u32 intr;
++
++	intr = mt76_rr(dev, MT_INT_SOURCE_CSR(dev));
++	mt76_wr(dev, MT_INT_SOURCE_CSR(dev), intr);
++
++	if (!test_bit(MT76_STATE_INITIALIZED, &dev->mt76.state))
++		return IRQ_NONE;
++
++	intr &= dev->mt76.mmio.irqmask;
++
++	if (intr & MT_INT_TX_DONE_ALL) {
++		mt7622_irq_disable(dev, MT_INT_TX_DONE_ALL);
++		napi_schedule(&dev->mt76.tx_napi);
++	}
++
++	if (intr & MT_INT_RX_DONE(0)) {
++		mt7622_irq_disable(dev, MT_INT_RX_DONE(0));
++		napi_schedule(&dev->mt76.napi[0]);
++	}
++
++	if (intr & MT_INT_RX_DONE(1)) {
++		mt7622_irq_disable(dev, MT_INT_RX_DONE(1));
++		napi_schedule(&dev->mt76.napi[1]);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int mt76_wmac_probe(struct platform_device *pdev)
++{
++	static const struct mt76_driver_ops drv_ops = {
++		/* txwi_size = txd size + txp size */
++		.txwi_size = MT_TXD_SIZE + sizeof(struct mt7622_txp),
++		.drv_flags = MT_DRV_TXWI_NO_FREE,
++		.tx_prepare_skb = mt7622_tx_prepare_skb,
++		.tx_complete_skb = mt7622_tx_complete_skb,
++		.rx_skb = mt7622_queue_rx_skb,
++		.rx_poll_complete = mt7622_rx_poll_complete,
++		.sta_ps = mt7622_sta_ps,
++		.sta_add = mt7622_sta_add,
++		.sta_assoc = mt7622_sta_assoc,
++		.sta_remove = mt7622_sta_remove,
++		.update_survey = mt7622_update_channel,
++	};
++	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	struct mt7622_dev *dev;
++	void __iomem *mem_base;
++	struct mt76_dev *mdev;
++	int irq;
++	int ret;
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		dev_err(&pdev->dev, "Failed to get device IRQ\n");
++		return irq;
++	}
++
++	mem_base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(mem_base)) {
++		dev_err(&pdev->dev, "Failed to get memory resource\n");
++		return PTR_ERR(mem_base);
++	}
++
++	mdev = mt76_alloc_device(&pdev->dev, sizeof(*dev), &mt7622_ops,
++				 &drv_ops);
++	if (!mdev)
++		return -ENOMEM;
++
++	dev = container_of(mdev, struct mt7622_dev, mt76);
++	mt76_mmio_init(mdev, mem_base);
++	dev->regs = mt7622_mmio_regs_base;
++
++	mdev->rev = (mt76_rr(dev, MT_HW_CHIPID(dev)) << 16) |
++		(mt76_rr(dev, MT_HW_REV(dev)) & 0xff);
++	dev_info(mdev->dev, "ASIC revision: %04x\n", mdev->rev);
++
++	ret = devm_request_irq(mdev->dev, irq, mt7622_irq_handler,
++			       IRQF_SHARED, KBUILD_MODNAME, dev);
++	if (ret)
++		goto error;
++
++	ret = mt7622_register_device(dev);
++	if (ret)
++		goto error;
++
++	return 0;
++error:
++	ieee80211_free_hw(mt76_hw(dev));
++	return ret;
++}
++
++static int mt76_wmac_remove(struct platform_device *pdev)
++{
++	struct mt76_dev *mdev = platform_get_drvdata(pdev);
++	struct mt7622_dev *dev = container_of(mdev, struct mt7622_dev, mt76);
++
++	mt7622_unregister_device(dev);
++
++	return 0;
++}
++
++static const struct of_device_id of_wmac_match[] = {
++	{ .compatible = "mediatek,mt7622-wmac" },
++	{},
++};
++
++struct platform_driver mt76_wmac_driver = {
++	.probe		= mt76_wmac_probe,
++	.remove		= mt76_wmac_remove,
++	.driver = {
++		.name = "mt7622_wmac",
++		.of_match_table = of_wmac_match,
++	},
++};
++module_platform_driver(mt76_wmac_driver);
++
++MODULE_DEVICE_TABLE(of, of_wmac_match);
++MODULE_FIRMWARE(MT7622_FIRMWARE_N9);
++MODULE_FIRMWARE(MT7622_ROM_PATCH);
++MODULE_LICENSE("Dual BSD/GPL");

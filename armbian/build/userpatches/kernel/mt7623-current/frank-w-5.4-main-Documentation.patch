@@ -1,0 +1,216 @@
+diff --git a/Documentation/devicetree/bindings/net/dsa/mt7530.txt b/Documentation/devicetree/bindings/net/dsa/mt7530.txt
+index c5ed5d2..dc226a4 100644
+--- a/Documentation/devicetree/bindings/net/dsa/mt7530.txt
++++ b/Documentation/devicetree/bindings/net/dsa/mt7530.txt
+@@ -5,6 +5,7 @@ Required properties:
+ 
+ - compatible: may be compatible = "mediatek,mt7530"
+ 	or compatible = "mediatek,mt7621"
++	or compatible = "mediatek,mt7531"
+ - #address-cells: Must be 1.
+ - #size-cells: Must be 0.
+ - mediatek,mcm: Boolean; if defined, indicates that either MT7530 is the part
+@@ -32,10 +33,13 @@ Required properties for the child nodes within ports container:
+ 
+ - reg: Port address described must be 6 for CPU port and from 0 to 5 for
+ 	user ports.
+-- phy-mode: String, must be either "trgmii" or "rgmii" for port labeled
+-	 "cpu".
++- phy-mode: String, the follow value would be acceptable for port labeled "cpu"
++	If compatible mediatek,mt7530 or mediatek,mt7621 is set,
++	must be either "trgmii" or "rgmii"
++	If compatible mediatek,mt7531 is set,
++	must be either "sgmii", "1000base-x" or "2500base-x"
+ 
+-Port 5 of the switch is muxed between:
++Port 5 of mt7530 and mt7621 switch is muxed between:
+ 1. GMAC5: GMAC5 can interface with another external MAC or PHY.
+ 2. PHY of port 0 or port 4: PHY interfaces with an external MAC like 2nd GMAC
+    of the SOC. Used in many setups where port 0/4 becomes the WAN port.
+@@ -308,3 +312,70 @@ Example 3: MT7621: Port 5 is connected to external PHY: Port 5 -> external PHY.
+ 		};
+ 	};
+ };
++
++Example 4:
++
++&eth {
++	gmac0: mac@0 {
++		compatible = "mediatek,eth-mac";
++		reg = <0>;
++		phy-mode = "2500base-x";
++
++		fixed-link {
++			speed = <1000>;
++			full-duplex;
++			pause;
++		};
++	};
++
++	&mdio0 {
++		switch@0 {
++			compatible = "mediatek,mt7531";
++			reg = <0>;
++			reset-gpios = <&pio 54 0>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++				reg = <0>;
++
++				port@0 {
++					reg = <0>;
++					label = "lan0";
++				};
++
++				port@1 {
++					reg = <1>;
++					label = "lan1";
++				};
++
++				port@2 {
++					reg = <2>;
++					label = "lan2";
++				};
++
++				port@3 {
++					reg = <3>;
++					label = "lan3";
++				};
++
++				port@4 {
++					reg = <4>;
++					label = "wan";
++				};
++
++				port@6 {
++					reg = <6>;
++					label = "cpu";
++					ethernet = <&gmac0>;
++					phy-mode = "2500base-x";
++
++					fixed-link {
++						speed = <1000>;
++						full-duplex;
++						pause;
++					};
++				};
++			};
++		};
++	};
+diff --git a/Documentation/devicetree/bindings/rtc/rtc-mt6397.txt b/Documentation/devicetree/bindings/rtc/rtc-mt6397.txt
+new file mode 100644
+index 00000000..55a0c88
+--- /dev/null
++++ b/Documentation/devicetree/bindings/rtc/rtc-mt6397.txt
+@@ -0,0 +1,29 @@
++Device-Tree bindings for MediaTek PMIC based RTC
++
++MediaTek PMIC based RTC is an independent function of MediaTek PMIC that works
++as a type of multi-function device (MFD). The RTC can be configured and set up
++with PMIC wrapper bus which is a common resource shared with the other
++functions found on the same PMIC.
++
++For MediaTek PMIC MFD bindings, see:
++../mfd/mt6397.txt
++
++For MediaTek PMIC wrapper bus bindings, see:
++../soc/mediatek/pwrap.txt
++
++Required properties:
++- compatible: Should be one of follows
++       "mediatek,mt6323-rtc": for MT6323 PMIC
++       "mediatek,mt6397-rtc": for MT6397 PMIC
++
++Example:
++
++       pmic {
++               compatible = "mediatek,mt6323";
++
++               ...
++
++               rtc {
++                       compatible = "mediatek,mt6323-rtc";
++               };
++       };
+diff --git a/Documentation/devicetree/bindings/usb/mediatek,musb.txt b/Documentation/devicetree/bindings/usb/mediatek,musb.txt
+new file mode 100644
+index 00000000..2b8a87c
+--- /dev/null
++++ b/Documentation/devicetree/bindings/usb/mediatek,musb.txt
+@@ -0,0 +1,57 @@
++MediaTek musb DRD/OTG controller
++-------------------------------------------
++
++Required properties:
++ - compatible      : should be one of:
++                     "mediatek,mt2701-musb"
++                     ...
++                     followed by "mediatek,mtk-musb"
++ - reg             : specifies physical base address and size of
++                     the registers
++ - interrupts      : interrupt used by musb controller
++ - interrupt-names : must be "mc"
++ - phys            : PHY specifier for the OTG phy
++ - dr_mode         : should be one of "host", "peripheral" or "otg",
++                     refer to usb/generic.txt
++ - clocks          : a list of phandle + clock-specifier pairs, one for
++                     each entry in clock-names
++ - clock-names     : must contain "main", "mcu", "univpll"
++                     for clocks of controller
++
++Optional properties:
++ - power-domains   : a phandle to USB power domain node to control USB's
++                     MTCMOS
++
++Required child nodes:
++ usb connector node as defined in bindings/connector/usb-connector.txt
++Optional properties:
++ - id-gpios        : input GPIO for USB ID pin.
++ - vbus-gpios      : input GPIO for USB VBUS pin.
++ - vbus-supply     : reference to the VBUS regulator, needed when supports
++                     dual-role mode
++ - usb-role-switch : use USB Role Switch to support dual-role switch, see
++                     usb/generic.txt.
++
++Example:
++
++usb2: usb@11200000 {
++	compatible = "mediatek,mt2701-musb",
++		     "mediatek,mtk-musb";
++	reg = <0 0x11200000 0 0x1000>;
++	interrupts = <GIC_SPI 32 IRQ_TYPE_LEVEL_LOW>;
++	interrupt-names = "mc";
++	phys = <&u2port2 PHY_TYPE_USB2>;
++	dr_mode = "otg";
++	clocks = <&pericfg CLK_PERI_USB0>,
++		 <&pericfg CLK_PERI_USB0_MCU>,
++		 <&pericfg CLK_PERI_USB_SLV>;
++	clock-names = "main","mcu","univpll";
++	power-domains = <&scpsys MT2701_POWER_DOMAIN_IFR_MSC>;
++	usb-role-switch;
++	connector{
++		compatible = "gpio-usb-b-connector", "usb-b-connector";
++		type = "micro";
++		id-gpios = <&pio 44 GPIO_ACTIVE_HIGH>;
++		vbus-supply = <&usb_vbus>;
++	};
++};
+diff --git a/MAINTAINERS b/MAINTAINERS
+index fe6fa5d..18f59d0 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -10273,6 +10273,13 @@ S:	Maintained
+ F:	drivers/net/dsa/mt7530.*
+ F:	net/dsa/tag_mtk.c
+ 
++MEDIATEK BOARD LEVEL SHUTDOWN DRIVERS
++M:	Sean Wang <sean.wang@mediatek.com>
++L:	linux-pm@vger.kernel.org
++S:	Maintained
++F:	Documentation/devicetree/bindings/power/reset/mt6323-poweroff.txt
++F:	drivers/power/reset/mt6323-poweroff.c
++
+ MEDIATEK JPEG DRIVER
+ M:	Rick Chang <rick.chang@mediatek.com>
+ M:	Bin Liu <bin.liu@mediatek.com>

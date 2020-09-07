@@ -1,0 +1,194 @@
+diff --git a/include/linux/mfd/mt6397/rtc.h b/include/linux/mfd/mt6397/rtc.h
+new file mode 100644
+index 00000000..f84b916
+--- /dev/null
++++ b/include/linux/mfd/mt6397/rtc.h
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2014-2019 MediaTek Inc.
++ *
++ * Author: Tianping.Fang <tianping.fang@mediatek.com>
++ *        Sean Wang <sean.wang@mediatek.com>
++ */
++
++#ifndef _LINUX_MFD_MT6397_RTC_H_
++#define _LINUX_MFD_MT6397_RTC_H_
++
++#include <linux/jiffies.h>
++#include <linux/mutex.h>
++#include <linux/regmap.h>
++#include <linux/rtc.h>
++
++#define RTC_BBPU               0x0000
++#define RTC_BBPU_CBUSY         BIT(6)
++#define RTC_BBPU_KEY            (0x43 << 8)
++
++#define RTC_WRTGR              0x003c
++
++#define RTC_IRQ_STA            0x0002
++#define RTC_IRQ_STA_AL         BIT(0)
++#define RTC_IRQ_STA_LP         BIT(3)
++
++#define RTC_IRQ_EN             0x0004
++#define RTC_IRQ_EN_AL          BIT(0)
++#define RTC_IRQ_EN_ONESHOT     BIT(2)
++#define RTC_IRQ_EN_LP          BIT(3)
++#define RTC_IRQ_EN_ONESHOT_AL  (RTC_IRQ_EN_ONESHOT | RTC_IRQ_EN_AL)
++
++#define RTC_AL_MASK            0x0008
++#define RTC_AL_MASK_DOW                BIT(4)
++
++#define RTC_TC_SEC             0x000a
++/* Min, Hour, Dom... register offset to RTC_TC_SEC */
++#define RTC_OFFSET_SEC         0
++#define RTC_OFFSET_MIN         1
++#define RTC_OFFSET_HOUR                2
++#define RTC_OFFSET_DOM         3
++#define RTC_OFFSET_DOW         4
++#define RTC_OFFSET_MTH         5
++#define RTC_OFFSET_YEAR                6
++#define RTC_OFFSET_COUNT       7
++
++#define RTC_AL_SEC             0x0018
++
++#define RTC_PDN2               0x002e
++#define RTC_PDN2_PWRON_ALARM   BIT(4)
++
++#define RTC_MIN_YEAR           1968
++#define RTC_BASE_YEAR          1900
++#define RTC_NUM_YEARS          128
++#define RTC_MIN_YEAR_OFFSET    (RTC_MIN_YEAR - RTC_BASE_YEAR)
++
++#define MTK_RTC_POLL_DELAY_US  10
++#define MTK_RTC_POLL_TIMEOUT   (jiffies_to_usecs(HZ))
++
++struct mt6397_rtc {
++	struct device           *dev;
++	struct rtc_device       *rtc_dev;
++
++	/* Protect register access from multiple tasks */
++	struct mutex            lock;
++	struct regmap           *regmap;
++	int                     irq;
++	u32                     addr_base;
++};
++
++#endif /* _LINUX_MFD_MT6397_RTC_H_ */
+diff --git a/include/linux/timekeeping32.h b/include/linux/timekeeping32.h
+index cc59cc9..494fec0 100644
+--- a/include/linux/timekeeping32.h
++++ b/include/linux/timekeeping32.h
+@@ -6,6 +6,20 @@
+  * over time so we can remove the file here.
+  */
+ 
++static inline void do_gettimeofday(struct timeval *tv)
++{
++	struct timespec64 now;
++
++	ktime_get_real_ts64(&now);
++	tv->tv_sec = now.tv_sec;
++	tv->tv_usec = now.tv_nsec/1000;
++}
++
++static inline void get_monotonic_boottime(struct timespec *ts)
++{
++	*ts = ktime_to_timespec(ktime_get_boottime());
++}
++
+ static inline unsigned long get_seconds(void)
+ {
+ 	return ktime_get_real_seconds();
+diff --git a/include/net/genetlink.h b/include/net/genetlink.h
+index 2d9e67a..3af5ce2 100644
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@ -143,6 +143,50 @@ struct genl_ops {
+ };
+ 
+ int genl_register_family(struct genl_family *family);
++
++/**
++ * genl_register_family_with_ops - register a generic netlink family with ops
++ * @family: generic netlink family
++ * @ops: operations to be registered
++ * @n_ops: number of elements to register
++ *
++ * Registers the specified family and operations from the specified table.
++ * Only one family may be registered with the same family name or identifier.
++ *
++ * The family id may equal GENL_ID_GENERATE causing an unique id to
++ * be automatically generated and assigned.
++ *
++ * Either a doit or dumpit callback must be specified for every registered
++ * operation or the function will fail. Only one operation structure per
++ * command identifier may be registered.
++ *
++ * See include/net/genetlink.h for more documenation on the operations
++ * structure.
++ *
++ * Return 0 on success or a negative error code.
++ */
++static inline int
++_genl_register_family_with_ops_grps(struct genl_family *family,
++				    const struct genl_ops *ops, size_t n_ops,
++				    const struct genl_multicast_group *mcgrps,
++				    size_t n_mcgrps)
++{
++	family->module = THIS_MODULE;
++	family->ops = ops;
++	family->n_ops = n_ops;
++	family->mcgrps = mcgrps;
++	family->n_mcgrps = n_mcgrps;
++	return genl_register_family(family);
++}
++#define genl_register_family_with_ops(family, ops)			\
++	_genl_register_family_with_ops_grps((family),			\
++					    (ops), ARRAY_SIZE(ops),	\
++					    NULL, 0)
++#define genl_register_family_with_ops_groups(family, ops, grps)	\
++	_genl_register_family_with_ops_grps((family),			\
++					    (ops), ARRAY_SIZE(ops),	\
++					    (grps), ARRAY_SIZE(grps))
++
+ int genl_unregister_family(const struct genl_family *family);
+ void genl_notify(const struct genl_family *family, struct sk_buff *skb,
+ 		 struct genl_info *info, u32 group, gfp_t flags);
+diff --git a/include/soc/mediatek/pmic_wrap.h b/include/soc/mediatek/pmic_wrap.h
+new file mode 100644
+index 00000000..5b5c852
+--- /dev/null
++++ b/include/soc/mediatek/pmic_wrap.h
+@@ -0,0 +1,19 @@
++/*
++ * Copyright (C) 2015 MediaTek Inc.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef __SOC_MEDIATEK_PMIC_WRAP_H
++#define __SOC_MEDIATEK_PMIC_WRAP_H
++
++extern struct regmap *pwrap_node_to_regmap(struct device_node *np);
++
++#endif /* __SOC_MEDIATEK_PMIC_WRAP_H */
+diff --git a/include/uapi/linux/genetlink.h b/include/uapi/linux/genetlink.h
+index 877f7fa..6a176b3 100644
+--- a/include/uapi/linux/genetlink.h
++++ b/include/uapi/linux/genetlink.h
+@@ -27,6 +27,7 @@ struct genlmsghdr {
+ /*
+  * List of reserved static generic netlink identifiers:
+  */
++#define GENL_ID_GENERATE	0
+ #define GENL_ID_CTRL		NLMSG_MIN_TYPE
+ #define GENL_ID_VFS_DQUOT	(NLMSG_MIN_TYPE + 1)
+ #define GENL_ID_PMCRAID		(NLMSG_MIN_TYPE + 2)
